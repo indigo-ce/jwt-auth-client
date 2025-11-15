@@ -16,11 +16,11 @@ let package = Package(
       targets: ["JWTAuth"])
   ],
   dependencies: [
-    .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.9.2"),
-    .package(url: "https://github.com/pointfreeco/swift-sharing", from: "2.5.2"),
+    .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.10.0"),
+    .package(url: "https://github.com/pointfreeco/swift-sharing", from: "2.7.4"),
     .package(url: "https://github.com/auth0/JWTDecode.swift", from: "3.3.0"),
     .package(url: "https://github.com/auth0/SimpleKeychain", from: "1.3.0"),
-    .package(url: "https://github.com/indigo-ce/http-request-client", from: "1.4.0"),
+    .package(url: "https://github.com/indigo-ce/http-request-client", from: "1.5.0"),
     .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.5"),
   ],
   targets: [
