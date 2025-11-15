@@ -4,10 +4,10 @@ import PackageDescription
 let package = Package(
   name: "JWTAuth",
   platforms: [
-    .macOS(.v14),
-    .iOS(.v17),
-    .watchOS(.v9),
-    .tvOS(.v17),
+    .macOS(.v15),
+    .iOS(.v18),
+    .watchOS(.v10),
+    .tvOS(.v18),
   ],
   products: [
     // Products define the executables and libraries a package produces, making them visible to other packages.
