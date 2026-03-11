@@ -3,11 +3,6 @@ import DependenciesMacros
 import Foundation
 @preconcurrency import SimpleKeychain
 
-/// A wrapper that makes SimpleKeychain conform to Sendable for use in concurrent contexts.
-///
-/// This extension allows the SimpleKeychain to be used safely across different async contexts
-/// in the dependency injection system.
-extension SimpleKeychain: @unchecked @retroactive Sendable {}
 
 extension DependencyValues {
   /// Access to the SimpleKeychain instance via the dependency injection system.
