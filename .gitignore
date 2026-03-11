@@ -9,3 +9,4 @@ DerivedData/
 .index-build/
 docs/
 .claude/settings.local.json
+.claude/skills/pfw-*
