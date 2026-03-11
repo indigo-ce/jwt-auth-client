@@ -20,43 +20,43 @@ When a user logs in with credentials, exchange them for JWT tokens:
 
 ```swift
 struct LoginFeature: Reducer {
-    @Dependency(\.authTokensClient) var authTokensClient
-    @Dependency(\.httpRequestClient) var httpRequestClient
-    
-    enum Action {
-        case loginButtonTapped
-        case loginResponse(Result<LoginResponse, Error>)
+  @Dependency(\.authTokensClient) var authTokensClient
+  @Dependency(\.httpRequestClient) var httpRequestClient
+
+  enum Action {
+    case loginButtonTapped
+    case loginResponse(Result<LoginResponse, Error>)
+  }
+
+  func reduce(into state: inout State, action: Action) -> Effect<Action> {
+    switch action {
+    case .loginButtonTapped:
+      return .run { [credentials = state.credentials] send in
+        await send(.loginResponse(Result {
+          let response: SuccessResponse<LoginResponse> = try await httpRequestClient.send(
+            .post("/auth/login")
+            .body(credentials)
+          )
+          return response.data
+        }))
+      }
+
+    case let .loginResponse(.success(loginResponse)):
+      let tokens = AuthTokens(
+        access: loginResponse.accessToken,
+        refresh: loginResponse.refreshToken
+      )
+
+      return .run { send in
+        try await authTokensClient.save(tokens)
+        // Navigation handled by parent reducer based on session state
+      }
+
+    case let .loginResponse(.failure(error)):
+      state.error = error.localizedDescription
+      return .none
     }
-    
-    func reduce(into state: inout State, action: Action) -> Effect<Action> {
-        switch action {
-        case .loginButtonTapped:
-            return .run { [credentials = state.credentials] send in
-                await send(.loginResponse(Result {
-                    let response: SuccessResponse<LoginResponse> = try await httpRequestClient.send(
-                        .post("/auth/login")
-                        .body(credentials)
-                    )
-                    return response.data
-                }))
-            }
-            
-        case let .loginResponse(.success(loginResponse)):
-            let tokens = AuthTokens(
-                access: loginResponse.accessToken,
-                refresh: loginResponse.refreshToken
-            )
-            
-            return .run { send in
-                try await authTokensClient.save(tokens)
-                // Navigation handled by parent reducer based on session state
-            }
-            
-        case let .loginResponse(.failure(error)):
-            state.error = error.localizedDescription
-            return .none
-        }
-    }
+  }
 }
 ```
 
@@ -66,26 +66,26 @@ Load the saved session when the app starts:
 
 ```swift
 struct AppFeature: Reducer {
-    @Dependency(\.jwtAuthClient) var authClient
-    
-    enum Action {
-        case onAppear
-        case sessionLoaded
+  @Dependency(\.jwtAuthClient) var authClient
+
+  enum Action {
+    case onAppear
+    case sessionLoaded
+  }
+
+  func reduce(into state: inout State, action: Action) -> Effect<Action> {
+    switch action {
+    case .onAppear:
+      return .run { send in
+        try await authClient.loadSession()
+        await send(.sessionLoaded)
+      }
+
+    case .sessionLoaded:
+      // The session is now available via @Shared(.authSession)
+      return .none
     }
-    
-    func reduce(into state: inout State, action: Action) -> Effect<Action> {
-        switch action {
-        case .onAppear:
-            return .run { send in
-                try await authClient.loadSession()
-                await send(.sessionLoaded)
-            }
-            
-        case .sessionLoaded:
-            // The session is now available via @Shared(.authSession)
-            return .none
-        }
-    }
+  }
 }
 ```
 
@@ -97,7 +97,7 @@ struct AppFeature: Reducer {
 @Dependency(\.jwtAuthClient) var authClient
 
 let userProfile: SuccessResponse<UserProfile> = try await authClient.sendAuthenticated(
-    .get("/user/profile")
+  .get("/user/profile")
 )
 ```
 
@@ -105,14 +105,14 @@ let userProfile: SuccessResponse<UserProfile> = try await authClient.sendAuthent
 
 ```swift
 let posts: SuccessResponse<[Post]> = try await authClient.sendAuthenticated(
-    .get("/posts"),
-    refreshExpiredToken: true,  // Default: true
-    decoder: customDecoder,
-    urlSession: customSession,
-    timeoutInterval: 30
+  .get("/posts"),
+  refreshExpiredToken: true,  // Default: true
+  decoder: customDecoder,
+  urlSession: customSession,
+  timeoutInterval: 30
 ) {
-    // Custom middleware
-    addCustomHeaders()
+  // Custom middleware
+  addCustomHeaders()
 }
 ```
 
@@ -121,17 +121,17 @@ let posts: SuccessResponse<[Post]> = try await authClient.sendAuthenticated(
 ```swift
 // For endpoints that might return errors
 let result: Response<UserProfile, APIError> = try await authClient.sendAuthenticated(
-    .get("/user/profile")
+  .get("/user/profile")
 )
 
 switch result {
 case .success(let userProfile):
-    // Handle success
-    print("User: \(userProfile.name)")
-    
+  // Handle success
+  print("User: \(userProfile.name)")
+
 case .failure(let apiError):
-    // Handle API error
-    print("API Error: \(apiError.message)")
+  // Handle API error
+  print("API Error: \(apiError.message)")
 }
 ```
 
@@ -143,14 +143,14 @@ Token refresh is handled automatically by the `sendAuthenticated` methods. Howev
 @Dependency(\.jwtAuthClient) var authClient
 
 do {
-    try await authClient.refreshExpiredTokens()
+  try await authClient.refreshExpiredTokens()
 } catch AuthTokens.Error.missingToken {
-    // No tokens available, redirect to login
+  // No tokens available, redirect to login
 } catch {
-    // Refresh failed, tokens may be invalid
-    // Clear tokens and redirect to login
-    @Dependency(\.authTokensClient) var authTokensClient
-    try await authTokensClient.destroy()
+  // Refresh failed, tokens may be invalid
+  // Clear tokens and redirect to login
+  @Dependency(\.authTokensClient) var authTokensClient
+  try await authTokensClient.destroy()
 }
 ```
 
@@ -160,30 +160,30 @@ do {
 
 ```swift
 struct ProfileFeature: Reducer {
-    @Dependency(\.authTokensClient) var authTokensClient
-    
-    enum Action {
-        case logoutButtonTapped
-        case logoutCompleted
+  @Dependency(\.authTokensClient) var authTokensClient
+
+  enum Action {
+    case logoutButtonTapped
+    case logoutCompleted
+  }
+
+  func reduce(into state: inout State, action: Action) -> Effect<Action> {
+    switch action {
+    case .logoutButtonTapped:
+      return .run { send in
+        // Optional: Call logout endpoint
+        _ = try? await authClient.send(.post("/auth/logout"))
+
+        // Clear local tokens
+        try await authTokensClient.destroy()
+        await send(.logoutCompleted)
+      }
+
+    case .logoutCompleted:
+      // Navigation handled by parent based on session state
+      return .none
     }
-    
-    func reduce(into state: inout State, action: Action) -> Effect<Action> {
-        switch action {
-        case .logoutButtonTapped:
-            return .run { send in
-                // Optional: Call logout endpoint
-                _ = try? await authClient.send(.post("/auth/logout"))
-                
-                // Clear local tokens
-                try await authTokensClient.destroy()
-                await send(.logoutCompleted)
-            }
-            
-        case .logoutCompleted:
-            // Navigation handled by parent based on session state
-            return .none
-        }
-    }
+  }
 }
 ```
 
@@ -194,11 +194,11 @@ When refresh tokens expire, the client automatically clears all tokens:
 ```swift
 // This happens automatically in JWTAuthClient.refreshExpiredTokens()
 do {
-    let newTokens = try await refresh(tokens)
-    try await authTokensClient.set(newTokens)
+  let newTokens = try await refresh(tokens)
+  try await authTokensClient.set(newTokens)
 } catch {
-    // Refresh failed, clear all tokens
-    try await authTokensClient.destroy()
+  // Refresh failed, clear all tokens
+  try await authTokensClient.destroy()
 }
 ```
 
@@ -208,25 +208,25 @@ Monitor authentication state across your app:
 
 ```swift
 struct AppView: View {
-    @Shared(.authSession) var session
-    
-    var body: some View {
-        switch session {
-        case .none, .some(.missing):
-            LoginView()
-            
-        case .some(.expired(let tokens)):
-            // Optionally show "refreshing" UI
-            // The client will automatically attempt refresh
-            ProgressView("Refreshing session...")
-            
-        case .some(.valid(let tokens)):
-            TabView {
-                HomeView()
-                ProfileView()
-            }
-        }
+  @Shared(.authSession) var session
+
+  var body: some View {
+    switch session {
+    case .none, .some(.missing):
+      LoginView()
+
+    case .some(.expired(let tokens)):
+      // Optionally show "refreshing" UI
+      // The client will automatically attempt refresh
+      ProgressView("Refreshing session...")
+
+    case .some(.valid(let tokens)):
+      TabView {
+        HomeView()
+        ProfileView()
+      }
     }
+  }
 }
 ```
 
@@ -236,20 +236,20 @@ Handle various authentication errors:
 
 ```swift
 do {
-    let response = try await authClient.sendAuthenticated(.get("/protected-resource"))
+  let response = try await authClient.sendAuthenticated(.get("/protected-resource"))
 } catch AuthTokens.Error.missingToken {
-    // No tokens available
-    redirectToLogin()
+  // No tokens available
+  redirectToLogin()
 } catch AuthTokens.Error.expiredToken {
-    // Token expired (shouldn't happen with auto-refresh)
-    try await authClient.refreshExpiredTokens()
+  // Token expired (shouldn't happen with auto-refresh)
+  try await authClient.refreshExpiredTokens()
 } catch AuthTokens.Error.invalidToken {
-    // Token is malformed
-    try await authTokensClient.destroy()
-    redirectToLogin()
+  // Token is malformed
+  try await authTokensClient.destroy()
+  redirectToLogin()
 } catch {
-    // Other network or API errors
-    handleGeneralError(error)
+  // Other network or API errors
+  handleGeneralError(error)
 }
 ```
 

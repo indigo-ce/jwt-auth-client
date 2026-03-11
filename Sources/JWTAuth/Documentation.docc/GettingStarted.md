@@ -14,10 +14,10 @@ Then add it to your target dependencies:
 
 ```swift
 .target(
-    name: "YourApp",
-    dependencies: [
-        .product(name: "JWTAuth", package: "jwt-auth-client")
-    ]
+  name: "YourApp",
+  dependencies: [
+    .product(name: "JWTAuth", package: "jwt-auth-client")
+  ]
 )
 ```
 
@@ -36,27 +36,27 @@ Create a live implementation of the `JWTAuthClient`:
 
 ```swift
 extension JWTAuthClient: @retroactive DependencyKey {
-    static let liveValue = Self(
-        baseURL: {
-            "https://your-api.com/api"
-        },
-        refresh: { tokens in
-            // Implement your token refresh logic here. For example:
-            let request = URLRequest(url: URL(string: "https://your-api.com/api/auth/refresh")!)
-            var request = request
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(tokens.refresh)", forHTTPHeaderField: "Authorization")
+  static let liveValue = Self(
+    baseURL: {
+      "https://your-api.com/api"
+    },
+    refresh: { tokens in
+      // Implement your token refresh logic here. For example:
+      let request = URLRequest(url: URL(string: "https://your-api.com/api/auth/refresh")!)
+      var request = request
+      request.httpMethod = "POST"
+      request.setValue("Bearer \(tokens.refresh)", forHTTPHeaderField: "Authorization")
 
-            let (data, _) = try await URLSession.shared.data(for: request)
-            let refreshResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
+      let (data, _) = try await URLSession.shared.data(for: request)
+      let refreshResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
 
-            // Return new tokens
-            return AuthTokens(
-                access: refreshResponse.accessToken,
-                refresh: refreshResponse.refreshToken
-            )
-        }
-    )
+      // Return new tokens
+      return AuthTokens(
+        access: refreshResponse.accessToken,
+        refresh: refreshResponse.refreshToken
+      )
+    }
+  )
 }
 ```
 
@@ -67,20 +67,20 @@ In your app's initialization (typically in your `App` structure or main view):
 ```swift
 @main
 struct MyApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .task {
-                    @Dependency(\.jwtAuthClient) var authClient
+  var body: some Scene {
+    WindowGroup {
+      ContentView()
+        .task {
+          @Dependency(\.jwtAuthClient) var authClient
 
-                    do {
-                        try await authClient.loadSession()
-                    } catch {
-                        print("Failed to load session: \(error)")
-                    }
-                }
+          do {
+            try await authClient.loadSession()
+          } catch {
+            print("Failed to load session: \(error)")
+          }
         }
     }
+  }
 }
 ```
 
@@ -90,18 +90,18 @@ Use the shared authentication session in your views and reducers:
 
 ```swift
 struct ContentView: View {
-    @Shared(.authSession) var session
+  @Shared(.authSession) var session
 
-    var body: some View {
-        switch session {
-        case .none, .some(.missing):
-            LoginView()
-        case .some(.expired):
-            Text("Session expired. Please log in again.")
-        case .some(.valid(let tokens)):
-            MainAppView()
-        }
+  var body: some View {
+    switch session {
+    case .none, .some(.missing):
+      LoginView()
+    case .some(.expired):
+      Text("Session expired. Please log in again.")
+    case .some(.valid(let tokens)):
+      MainAppView()
     }
+  }
 }
 ```
 
@@ -114,7 +114,7 @@ Once you have tokens, you can make authenticated API calls:
 
 // The client automatically handles token refresh
 let response: SuccessResponse<UserProfile> = try await authClient.sendAuthenticated(
-    .get("/user/profile")
+  .get("/user/profile")
 )
 
 let userProfile = response.data

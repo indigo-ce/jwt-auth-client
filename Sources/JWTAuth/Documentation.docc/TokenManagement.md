@@ -8,8 +8,8 @@ The `AuthTokens` structure is the core data type for managing JWT tokens:
 
 ```swift
 let tokens = AuthTokens(
-    access: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
-    refresh: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+  access: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
+  refresh: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
 )
 ```
 
@@ -19,10 +19,10 @@ Check if tokens are expired:
 
 ```swift
 if tokens.isExpired {
-    // Access token has expired
-    // The client will automatically refresh when needed
+  // Access token has expired
+  // The client will automatically refresh when needed
 } else {
-    // Token is still valid
+  // Token is still valid
 }
 ```
 
@@ -110,20 +110,20 @@ Access the current session across your app:
 // Check session state
 switch session {
 case .none:
-    // No session loaded yet
-    showLoadingSpinner()
-    
+  // No session loaded yet
+  showLoadingSpinner()
+
 case .some(.missing):
-    // No tokens available
-    showLoginScreen()
-    
+  // No tokens available
+  showLoginScreen()
+
 case .some(.expired(let tokens)):
-    // Tokens exist but access token is expired
-    showRefreshingIndicator()
-    
+  // Tokens exist but access token is expired
+  showRefreshingIndicator()
+
 case .some(.valid(let tokens)):
-    // User is authenticated with valid tokens
-    showMainApp()
+  // User is authenticated with valid tokens
+  showMainApp()
 }
 ```
 
@@ -153,8 +153,8 @@ The default behavior refreshes tokens automatically:
 
 ```swift
 let response = try await authClient.sendAuthenticated(
-    .get("/protected-endpoint"),
-    refreshExpiredToken: true  // Default
+  .get("/protected-endpoint"),
+  refreshExpiredToken: true  // Default
 )
 ```
 
@@ -165,8 +165,8 @@ Control when tokens are refreshed:
 ```swift
 // Disable automatic refresh
 let response = try await authClient.sendAuthenticated(
-    .get("/protected-endpoint"),
-    refreshExpiredToken: false
+  .get("/protected-endpoint"),
+  refreshExpiredToken: false
 )
 ```
 
@@ -187,8 +187,8 @@ Refresh tokens before they expire:
 if let tokens = session?.tokens,
    let expirationDate = tokens[date: "exp"],
    expirationDate.timeIntervalSinceNow < 300 {
-    
-    try await authClient.refreshExpiredTokens()
+
+  try await authClient.refreshExpiredTokens()
 }
 ```
 
@@ -199,10 +199,10 @@ if let tokens = session?.tokens,
 ```swift
 // In your app initialization
 prepareDependencies {
-    $0.simpleKeychain = SimpleKeychain(
-        service: "com.yourapp.custom-service",
-        accessGroup: "group.yourapp.shared"
-    )
+  $0.simpleKeychain = SimpleKeychain(
+    service: "com.yourapp.custom-service",
+    accessGroup: "group.yourapp.shared"
+  )
 }
 ```
 
@@ -212,8 +212,8 @@ Extend the keychain client with custom keys:
 
 ```swift
 extension KeychainClient.Keys {
-    static let customToken = Self(value: "custom_token")
-    static let deviceId = Self(value: "device_id")
+  static let customToken = Self(value: "custom_token")
+  static let deviceId = Self(value: "device_id")
 }
 
 // Usage
@@ -240,14 +240,14 @@ logger.debug("Token is expired: \(tokens.isExpired)")
 ```swift
 // Clear tokens when user changes password
 func onPasswordChanged() async throws {
-    @Dependency(\.authTokensClient) var authTokensClient
-    try await authTokensClient.destroy()
+  @Dependency(\.authTokensClient) var authTokensClient
+  try await authTokensClient.destroy()
 }
 
 // Clear tokens on app uninstall/reset
 func resetAppData() async throws {
-    @Dependency(\.keychainClient) var keychainClient
-    try await keychainClient.reset()
+  @Dependency(\.keychainClient) var keychainClient
+  try await keychainClient.reset()
 }
 ```
 
@@ -257,9 +257,9 @@ func resetAppData() async throws {
 // Check token claims match expected values
 guard let userId = tokens[string: "user_id"],
       userId == currentUser.id else {
-    // Token doesn't match current user
-    try await authTokensClient.destroy()
-    throw AuthenticationError.tokenMismatch
+  // Token doesn't match current user
+  try await authTokensClient.destroy()
+  throw AuthenticationError.tokenMismatch
 }
 ```
 
@@ -269,16 +269,16 @@ guard let userId = tokens[string: "user_id"],
 
 ```swift
 do {
-    try await authTokensClient.save(tokens)
+  try await authTokensClient.save(tokens)
 } catch AuthTokens.Error.missingToken {
-    // No tokens provided
+  // No tokens provided
 } catch AuthTokens.Error.invalidToken {
-    // Token format is invalid
+  // Token format is invalid
 } catch AuthTokens.Error.expiredToken {
-    // Token has expired
+  // Token has expired
 } catch KeychainError.savingFailed(let message) {
-    // Keychain operation failed
-    print("Keychain error: \(message)")
+  // Keychain operation failed
+  print("Keychain error: \(message)")
 }
 ```
 
@@ -286,29 +286,29 @@ do {
 
 ```swift
 func handleTokenError(_ error: Error) async {
-    @Dependency(\.authTokensClient) var authTokensClient
-    
-    switch error {
-    case AuthTokens.Error.expiredToken:
-        // Try to refresh
-        try? await authClient.refreshExpiredTokens()
-        
-    case AuthTokens.Error.invalidToken,
-         AuthTokens.Error.missingToken:
-        // Clear invalid tokens and redirect to login
-        try? await authTokensClient.destroy()
-        redirectToLogin()
-        
-    case KeychainError.savingFailed,
-         KeychainError.loadingFailed:
-        // Keychain issues - try to recover
-        try? await keychainClient.reset()
-        redirectToLogin()
-        
-    default:
-        // Other errors
-        showError(error.localizedDescription)
-    }
+  @Dependency(\.authTokensClient) var authTokensClient
+
+  switch error {
+  case AuthTokens.Error.expiredToken:
+    // Try to refresh
+    try? await authClient.refreshExpiredTokens()
+
+  case AuthTokens.Error.invalidToken,
+       AuthTokens.Error.missingToken:
+    // Clear invalid tokens and redirect to login
+    try? await authTokensClient.destroy()
+    redirectToLogin()
+
+  case KeychainError.savingFailed,
+       KeychainError.loadingFailed:
+    // Keychain issues - try to recover
+    try? await keychainClient.reset()
+    redirectToLogin()
+
+  default:
+    // Other errors
+    showError(error.localizedDescription)
+  }
 }
 ```
 
@@ -318,15 +318,15 @@ func handleTokenError(_ error: Error) async {
 
 ```swift
 extension AuthTokensClient {
-    static let testValue = Self(
-        save: { tokens in
-            // Mock save implementation
-            print("Saving tokens: \(tokens.access.prefix(10))...")
-        },
-        destroy: {
-            print("Destroying tokens")
-        }
-    )
+  static let testValue = Self(
+    save: { tokens in
+      // Mock save implementation
+      print("Saving tokens: \(tokens.access.prefix(10))...")
+    },
+    destroy: {
+      print("Destroying tokens")
+    }
+  )
 }
 ```
 
@@ -334,15 +334,15 @@ extension AuthTokensClient {
 
 ```swift
 func createTestTokens() -> AuthTokens {
-    return AuthTokens(
-        access: createTestJWT(claims: [
-            "user_id": "test_user",
-            "exp": Date().addingTimeInterval(3600).timeIntervalSince1970
-        ]),
-        refresh: createTestJWT(claims: [
-            "exp": Date().addingTimeInterval(86400).timeIntervalSince1970
-        ])
-    )
+  return AuthTokens(
+    access: createTestJWT(claims: [
+      "user_id": "test_user",
+      "exp": Date().addingTimeInterval(3600).timeIntervalSince1970
+    ]),
+    refresh: createTestJWT(claims: [
+      "exp": Date().addingTimeInterval(86400).timeIntervalSince1970
+    ])
+  )
 }
 ```
 
