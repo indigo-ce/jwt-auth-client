@@ -1,5 +1,5 @@
 {
-  "originHash" : "b2ae6794e5280face5357aebb6df072335d87209a9aa2a53bb9abeb4aa730ca1",
+  "originHash" : "cd6e8c62ffee433ca43dd69cdb3cce1a8b67a4257b3665ed6dfe53d0c7393489",
   "pins" : [
     {
       "identity" : "combine-schedulers",
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/indigo-ce/http-request-client",
       "state" : {
-        "revision" : "78d3df5ebf6b662e8ed86401fdc1cfda72b2e14e",
-        "version" : "1.5.0"
+        "revision" : "9133b9e19aabb60fa9194de6b291541fcc3823b4",
+        "version" : "1.6.0"
       }
     },
     {

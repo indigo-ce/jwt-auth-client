@@ -20,7 +20,8 @@ let package = Package(
     .package(url: "https://github.com/pointfreeco/swift-sharing", from: "2.7.4"),
     .package(url: "https://github.com/auth0/JWTDecode.swift", from: "4.0.0"),
     .package(url: "https://github.com/auth0/SimpleKeychain", from: "1.3.0"),
-    .package(url: "https://github.com/indigo-ce/http-request-client", from: "1.5.0"),
+    .package(url: "https://github.com/kean/Pulse.git", from: "5.1.4"),
+    .package(url: "https://github.com/indigo-ce/http-request-client", .upToNextMinor(from: "1.6.0")),
     .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.6"),
   ],
   targets: [
@@ -31,6 +32,7 @@ let package = Package(
       dependencies: [
         .product(name: "Dependencies", package: "swift-dependencies"),
         .product(name: "DependenciesMacros", package: "swift-dependencies"),
+        .product(name: "Pulse", package: "Pulse"),
         .product(name: "HTTPRequestClient", package: "http-request-client"),
         .product(name: "JWTDecode", package: "JWTDecode.swift"),
         .product(name: "Sharing", package: "swift-sharing"),
