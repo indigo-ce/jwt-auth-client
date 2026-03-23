@@ -3,6 +3,7 @@ import DependenciesMacros
 import Foundation
 import HTTPRequestBuilder
 import HTTPRequestClient
+import Pulse
 import Sharing
 
 /// A client for handling JWT-based authentication in Swift applications using TCA.
@@ -177,7 +178,7 @@ extension JWTAuthClient {
   public func send<T>(
     _ request: Request = .init(),
     decoder: JSONDecoder = .init(),
-    urlSession: URLSession = .shared,
+    urlSession: URLSessionProtocol = URLSession.shared,
     cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy,
     timeoutInterval: TimeInterval = 60,
     @RequestBuilder middleware: () -> RequestMiddleware = { identity }
@@ -210,7 +211,7 @@ extension JWTAuthClient {
     _ request: Request = .init(),
     refreshExpiredToken: Bool = true,
     decoder: JSONDecoder = .init(),
-    urlSession: URLSession = .shared,
+    urlSession: URLSessionProtocol = URLSession.shared,
     cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy,
     timeoutInterval: TimeInterval = 60,
     @RequestBuilder middleware: () -> RequestMiddleware = { identity }
@@ -259,7 +260,7 @@ extension JWTAuthClient {
   public func send<T, ServerError>(
     _ request: Request = .init(),
     decoder: JSONDecoder = .init(),
-    urlSession: URLSession = .shared,
+    urlSession: URLSessionProtocol = URLSession.shared,
     cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy,
     timeoutInterval: TimeInterval = 60,
     @RequestBuilder middleware: () -> RequestMiddleware = { identity }
@@ -296,7 +297,7 @@ extension JWTAuthClient {
     _ request: Request = .init(),
     decoder: JSONDecoder = .init(),
     refreshExpiredToken: Bool = true,
-    urlSession: URLSession = .shared,
+    urlSession: URLSessionProtocol = URLSession.shared,
     cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy,
     timeoutInterval: TimeInterval = 60,
     @RequestBuilder middleware: () -> RequestMiddleware = { identity }
