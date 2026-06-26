@@ -185,12 +185,17 @@ extension JWTAuthClient {
   ///   unreachable, etc.) — the stored credentials are **left intact** so a
   ///   later retry can succeed. The error is rethrown so callers can decide
   ///   whether to surface a retry option instead of silently logging the user
-  ///   out. If `authTokensClient.set(newTokens)` was what actually threw (for
-  ///   example a keychain save failure), the in-memory session is rolled
-  ///   back to the old `.expired(tokens)` — the live `AuthTokensClient`
-  ///   writes new tokens to memory before attempting the keychain writes,
-  ///   so without this rollback memory would be left on the new tokens while
-  ///   the keychain is empty.
+  ///   out. A concurrent session change (logout, new-user login) that lands
+  ///   while the refresh is in flight is therefore preserved.
+  /// - If `authTokensClient.set(newTokens)` throws (for example a keychain
+  ///   save failure), the in-memory session is rolled back to the old
+  ///   `.expired(tokens)` — the live `AuthTokensClient` writes the new tokens
+  ///   to `@Shared(.authSession)` before attempting the keychain writes, so
+  ///   without this rollback memory would be left on the new tokens while the
+  ///   keychain is partial. The check-and-rollback is performed atomically
+  ///   via `withLock` so a concurrent session change observed during the
+  ///   catch is not overwritten — we only roll back when the session still
+  ///   holds the new tokens we just persisted.
   ///
   /// In other words: only an explicit rejection from the server destroys the
   /// session. Anything else is treated as a transient hiccup and the user
@@ -200,6 +205,8 @@ extension JWTAuthClient {
   ///   - ``AuthTokens/Error/missingToken`` if no tokens are available.
   ///   - Any error thrown by `refresh` (other than ``AuthTokens/Error/refreshRejected``)
   ///     — see "Error handling" above.
+  ///   - Any error thrown by `authTokensClient.set(newTokens)`, after rolling
+  ///     back the in-memory session.
   ///
   /// ## Usage
   ///
@@ -227,34 +234,45 @@ extension JWTAuthClient {
     do {
       try tokens.validateAccessToken()
     } catch {
+      // Step 1: ask the server for fresh tokens. A transient failure
+      // here (URLError, timeout, DNS, decode, etc.) just rethrows
+      // without touching the session — no memory mutation has happened,
+      // and we must not undo a concurrent logout/new-user login that
+      // landed while the refresh was in flight.
+      let newTokens: AuthTokens
       do {
-        let newTokens = try await refresh(tokens)
-        try await authTokensClient.set(newTokens)
+        newTokens = try await refresh(tokens)
       } catch AuthTokens.Error.refreshRejected {
-        // The server explicitly rejected the refresh token (e.g. 401 from
-        // /auth/refresh, revoked/expired refresh token). Credentials are no
-        // longer valid — destroy them so the user is forced to re-authenticate.
-        //
-        // This branch intentionally does NOT rethrow so that callers like
-        // `sendAuthenticated` keep falling through to their existing
-        // `session?.tokens` check (which then throws `.missingToken`).
+        // The server explicitly rejected the refresh token (e.g. 401
+        // from /auth/refresh, revoked/expired refresh token).
+        // Credentials are no longer valid — destroy them so the user
+        // is forced to re-authenticate. This branch intentionally
+        // does NOT rethrow so that callers like `sendAuthenticated`
+        // keep falling through to their existing `session?.tokens`
+        // check (which then throws `.missingToken`).
         try await authTokensClient.destroy()
+        return
       } catch {
-        // Transient failure: the request didn't even reach a definitive
-        // "your refresh token is invalid" answer. Common causes are
-        // `URLError.cannotConnectToHost`, `.notConnectedToInternet`,
-        // `.timedOut`, DNS failures, decode errors, 5xx responses, etc.
-        //
-        // This branch also covers the `authTokensClient.set(newTokens)`
-        // step throwing — e.g. a keychain save failure. The live
-        // `AuthTokensClient` writes the new tokens to `@Shared(.authSession)`
-        // *before* attempting the keychain writes, so on `set` failure
-        // memory would otherwise be left on the new tokens even though the
-        // keychain is empty/partial. Roll the in-memory session back to the
-        // old `.expired(tokens)` so a later retry has the original refresh
-        // token to work with.
-        if session?.tokens != tokens {
-          $session.withLock { $0 = .expired(tokens) }
+        throw error
+      }
+
+      // Step 2: persist the new tokens. The live `AuthTokensClient`
+      // writes the new tokens to `@Shared(.authSession)` *before*
+      // attempting the keychain writes, so on `set` failure memory
+      // would otherwise be left on the new tokens even though the
+      // keychain is partial. Roll the in-memory session back to the
+      // old `.expired(tokens)` so a later retry has the original
+      // refresh token to work with — but only if the session still
+      // holds the new tokens we just persisted. withLock makes the
+      // check-and-set atomic so a concurrent session change observed
+      // during the catch is not overwritten.
+      do {
+        try await authTokensClient.set(newTokens)
+      } catch {
+        $session.withLock { current in
+          if current?.tokens == newTokens {
+            current = .expired(tokens)
+          }
         }
         throw error
       }
