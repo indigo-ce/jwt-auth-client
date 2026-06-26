@@ -548,14 +548,14 @@ extension AuthTokens {
 
 ```swift
 extension JWTAuthClient {
-  static let failingTestValue = Self(
+  static let rejectionMock = Self(
     baseURL: { "https://test.api" },
     refresh: { _ in
-      throw AuthTokens.Error.expiredToken
+      throw AuthTokens.Error.refreshRejected
     }
   )
 
-  static let networkErrorTestValue = Self(
+  static let transientErrorMock = Self(
     baseURL: { "https://test.api" },
     refresh: { _ in
       throw URLError(.notConnectedToInternet)
@@ -567,19 +567,28 @@ extension JWTAuthClient {
 ### Error Testing
 
 ```swift
-func testTokenRefreshFailure() async throws {
-  withDependencies {
-    $0.jwtAuthClient = .failingTestValue
+@Test func refreshExpiredTokensDestroysOnRejection() async throws {
+  // `.refreshRejected` is the explicit server-rejection signal.
+  // `refreshExpiredTokens()` swallows it, destroys the stored
+  // credentials, and returns normally — the caller does not see
+  // the error. Route the user to login.
+  await withDependencies {
+    $0.jwtAuthClient = .rejectionMock
   } operation: {
     @Dependency(\.jwtAuthClient) var authClient
+    try await authClient.refreshExpiredTokens()
+  }
+}
 
-    do {
+@Test func refreshExpiredTokensRethrowsTransientErrors() async throws {
+  // A transient `URLError` is rethrown so the caller can offer
+  // a retry. The stored credentials are preserved.
+  await withDependencies {
+    $0.jwtAuthClient = .transientErrorMock
+  } operation: {
+    @Dependency(\.jwtAuthClient) var authClient
+    await #expect(throws: URLError.self) {
       try await authClient.refreshExpiredTokens()
-      XCTFail("Expected error")
-    } catch AuthTokens.Error.expiredToken {
-      // Expected error
-    } catch {
-      XCTFail("Unexpected error: \(error)")
     }
   }
 }
@@ -587,7 +596,7 @@ func testTokenRefreshFailure() async throws {
 
 ## Best Practices
 
-1. **Always handle authentication errors** by clearing tokens and redirecting to login
+1. **Handle rejection and transient errors differently.** Only ``AuthTokens/Error/refreshRejected`` should clear tokens and route the user to login — and `refreshExpiredTokens()` already destroys the stored credentials for you. All other errors (network, timeout, decode, keychain save, ``AuthTokens/Error/expiredToken``, ``AuthTokens/Error/invalidToken``) are transient: surface a retry option instead of logging the user out.
 2. **Provide user-friendly error messages** instead of technical details
 3. **Implement retry logic** for network errors
 4. **Log errors appropriately** for debugging without exposing sensitive data
