@@ -10,9 +10,10 @@ Errors related to token validation and processing:
 
 ```swift
 public enum AuthTokens.Error: LocalizedError {
-  case missingToken    // No token available
-  case invalidToken    // Token format is invalid
-  case expiredToken    // Token has expired
+  case missingToken     // No token available
+  case invalidToken     // Token format is invalid
+  case expiredToken     // Token has expired
+  case refreshRejected  // Server explicitly rejected the refresh token
 }
 ```
 
@@ -30,6 +31,11 @@ do {
 } catch AuthTokens.Error.expiredToken {
   // This usually won't happen with auto-refresh
   try await authClient.refreshExpiredTokens()
+} catch AuthTokens.Error.refreshRejected {
+  // The refresh endpoint told us the refresh token is no longer valid.
+  // `authClient.refreshExpiredTokens()` will already have destroyed the
+  // stored credentials for you; route the user back to the login screen.
+  showLoginScreen()
 }
 ```
 
@@ -61,52 +67,74 @@ do {
 
 ### 1. Network Errors During Token Refresh
 
+`refreshExpiredTokens()` only destroys the stored credentials when the server
+**explicitly** rejects the refresh token (via `AuthTokens.Error.refreshRejected`).
+Anything else — `URLError.cannotConnectToHost`, `.notConnectedToInternet`,
+`.timedOut`, DNS failures, decode errors, 5xx responses — is treated as
+transient: the stored tokens are **left intact** and the error is rethrown so
+the caller can decide whether to surface a retry option.
+
 ```swift
 @Dependency(\.jwtAuthClient) var authClient
+@Dependency(\.authTokensClient) var authTokensClient
 
 do {
   try await authClient.refreshExpiredTokens()
+} catch AuthTokens.Error.missingToken {
+  // No tokens in storage — route the user to login.
+  redirectToLogin()
+} catch AuthTokens.Error.refreshRejected {
+  // Server said the refresh token is no longer valid.
+  // `refreshExpiredTokens()` has already destroyed the stored credentials,
+  // so we just need to react.
+  redirectToLogin()
 } catch {
+  // Transient failure: bad network, timeout, decode error, etc. The
+  // stored tokens are still valid — let the user retry.
   if error.isNetworkError {
-    // Show retry option
     showNetworkErrorAlert(retry: {
       try await authClient.refreshExpiredTokens()
     })
   } else {
-    // Authentication failed, clear tokens
-    try await authTokensClient.destroy()
-    redirectToLogin()
+    showRetryAlert(error: error) {
+      try await authClient.refreshExpiredTokens()
+    }
   }
 }
 ```
 
+> ⚠️ **Important:** Do **not** call `authTokensClient.destroy()` from your
+> generic `catch` block. `refreshExpiredTokens()` already destroys credentials
+> when a definitive rejection happens, and you do not want to wipe a still-
+> valid refresh token on a transient network blip.
+
 ### 2. Server Returns Invalid Tokens
 
+When the refresh endpoint rejects the request, the `refresh` closure should
+signal that as `AuthTokens.Error.refreshRejected` so the library knows the
+credentials are no longer valid and destroys them. **Do not** call
+`authTokensClient.destroy()` from inside `refresh` — that would wipe the
+session on every transient failure too.
+
 ```swift
-// In your refresh implementation
 extension JWTAuthClient: @retroactive DependencyKey {
   static let liveValue = Self(
     baseURL: { "https://api.example.com" },
     refresh: { tokens in
       do {
         let response = try await refreshTokensFromServer(tokens)
-
-        // Validate the new tokens before returning
-        let newTokens = AuthTokens(
+        return AuthTokens(
           access: response.accessToken,
           refresh: response.refreshToken
         )
-
-        // This will throw if tokens are invalid
-        _ = try newTokens.toJWT()
-
-        return newTokens
-      } catch {
-        // If refresh fails, clear all tokens
-        @Dependency(\.authTokensClient) var authTokensClient
-        try await authTokensClient.destroy()
-        throw error
+      } catch let error as APIError where error.statusCode == 401 {
+        // Server explicitly rejected the refresh token.
+        // Tell the library to destroy the credentials.
+        throw AuthTokens.Error.refreshRejected
       }
+      // Any other error (URLError, decoding failure, 5xx, etc.) is
+      // automatically treated as transient by `refreshExpiredTokens()`
+      // and the stored tokens are preserved.
     }
   )
 }
@@ -150,7 +178,11 @@ extension ErrorHandler: DependencyKey {
 
       switch error {
       case AuthTokens.Error.missingToken,
-           AuthTokens.Error.invalidToken:
+           AuthTokens.Error.invalidToken,
+           AuthTokens.Error.refreshRejected:
+        // For `refreshRejected`, `refreshExpiredTokens()` has already
+        // destroyed the stored credentials before rethrowing; the
+        // remaining cases need us to do it ourselves.
         try await authTokensClient.destroy()
         NotificationCenter.default.post(name: .authenticationRequired, object: nil)
 
@@ -226,6 +258,9 @@ extension Error {
 
     case AuthTokens.Error.invalidToken:
       return "Authentication error. Please log in again"
+
+    case AuthTokens.Error.refreshRejected:
+      return "Your session is no longer valid. Please log in again"
 
     case KeychainError.savingFailed:
       return "Unable to securely save your login. Please try again"

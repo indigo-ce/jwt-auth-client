@@ -155,19 +155,23 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   #expect(AuthTokens.Error.missingToken.errorDescription == "The token seems to be missing.")
   #expect(AuthTokens.Error.invalidToken.errorDescription == "The token is invalid.")
   #expect(AuthTokens.Error.expiredToken.errorDescription == "The token is expired.")
+  #expect(AuthTokens.Error.refreshRejected.errorDescription == "The refresh token was rejected by the server.")
 }
 
 @Test func authTokensErrorTitle() {
   #expect(AuthTokens.Error.missingToken.title == "Session Error")
   #expect(AuthTokens.Error.invalidToken.title == "Session Error")
   #expect(AuthTokens.Error.expiredToken.title == "Session Error")
+  #expect(AuthTokens.Error.refreshRejected.title == "Session Error")
 }
 
 @Test func authTokensErrorEquality() {
   #expect(AuthTokens.Error.missingToken == AuthTokens.Error.missingToken)
   #expect(AuthTokens.Error.invalidToken == AuthTokens.Error.invalidToken)
   #expect(AuthTokens.Error.expiredToken == AuthTokens.Error.expiredToken)
+  #expect(AuthTokens.Error.refreshRejected == AuthTokens.Error.refreshRejected)
   #expect(AuthTokens.Error.missingToken != AuthTokens.Error.invalidToken)
+  #expect(AuthTokens.Error.refreshRejected != AuthTokens.Error.expiredToken)
 }
 
 // MARK: - AuthSession Tests
@@ -412,12 +416,57 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   }
 }
 
-@Test func refreshExpiredTokensDestroysTokensWhenRefreshFails() async throws {
+@Test func refreshExpiredTokensDestroysTokensWhenRefreshRejected() async throws {
   let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
   let destroyCalled = Box(false)
+  let saveCalled = Box(false)
   let client = JWTAuthClient(
     baseURL: { "https://api.example.com" },
-    refresh: { _ in throw AuthTokens.Error.invalidToken }
+    refresh: { _ in throw AuthTokens.Error.refreshRejected }
+  )
+  try await withDependencies {
+    // Use a wrapping `AuthTokensClient` so we can observe `destroy`/`save`
+    // being called while still delegating to the live impl (which is what
+    // actually updates `@Shared(.authSession)` and the keychain).
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(
+      save: { tokens in
+        saveCalled.value = true
+        try await AuthTokensClient.liveValue.save(tokens)
+      },
+      destroy: {
+        destroyCalled.value = true
+        try await AuthTokensClient.liveValue.destroy()
+      }
+    )
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(expiredTokens) }
+
+    // Server-side rejection: refreshExpiredTokens() should call destroy()
+    // and NOT rethrow — so `sendAuthenticated` can keep falling through to
+    // its existing `session?.tokens` check.
+    try await client.refreshExpiredTokens()
+
+    #expect(destroyCalled.value == true)
+    #expect(saveCalled.value == false)
+    #expect(session == nil)
+  }
+}
+
+@Test func refreshExpiredTokensKeepsTokensOnTransportError() async throws {
+  let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
+  let destroyCalled = Box(false)
+  let saveCalled = Box(false)
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in throw URLError(.notConnectedToInternet) }
   )
   try await withDependencies {
     $0.keychainClient = KeychainClient(
@@ -426,12 +475,102 @@ private final class Box<T: Sendable>: @unchecked Sendable {
       delete: { _ in },
       reset: {}
     )
-    $0.authTokensClient = .init(save: { _ in }, destroy: { destroyCalled.value = true })
+    $0.authTokensClient = .init(
+      save: { _ in saveCalled.value = true },
+      destroy: { destroyCalled.value = true }
+    )
     $0.jwtAuthClient = client
   } operation: {
     @Shared(.authSession) var session
     $session.withLock { $0 = .expired(expiredTokens) }
-    try await client.refreshExpiredTokens()
-    #expect(destroyCalled.value == true)
+
+    // Network unreachable is a transient failure: refreshExpiredTokens()
+    // must NOT destroy the tokens, must rethrow the URLError so the caller
+    // can decide to retry, and must leave the session untouched so a later
+    // retry can succeed.
+    await #expect(throws: URLError.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    #expect(destroyCalled.value == false)
+    #expect(saveCalled.value == false)
+    #expect(session == .expired(expiredTokens))
+  }
+}
+
+@Test func refreshExpiredTokensKeepsTokensOnGenericError() async throws {
+  struct NotAServerRejection: Error, Equatable {}
+
+  let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
+  let destroyCalled = Box(false)
+  let saveCalled = Box(false)
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in throw NotAServerRejection() }
+  )
+  try await withDependencies {
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(
+      save: { _ in saveCalled.value = true },
+      destroy: { destroyCalled.value = true }
+    )
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(expiredTokens) }
+
+    // Any non-`.refreshRejected` error is transient: same expectations as
+    // the URLError case.
+    await #expect(throws: NotAServerRejection.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    #expect(destroyCalled.value == false)
+    #expect(saveCalled.value == false)
+    #expect(session == .expired(expiredTokens))
+  }
+}
+
+@Test func refreshExpiredTokensKeepsTokensOnKeychainSaveFailureAfterRefresh() async throws {
+  // Refresh succeeded, but persisting the new tokens to the keychain failed.
+  // That's not a server-side rejection — the refresh token is still valid —
+  // so we must NOT destroy, must rethrow the keychain error, and must leave
+  // the existing (expired) tokens intact so a later retry can succeed.
+  struct KeychainSaveFailed: Error {}
+
+  let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
+  let destroyCalled = Box(false)
+  let newTokens = AuthTokens(access: validJWT, refresh: "new-refresh")
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in newTokens }
+  )
+  await withDependencies {
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(
+      save: { _ in throw KeychainSaveFailed() },
+      destroy: { destroyCalled.value = true }
+    )
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(expiredTokens) }
+
+    await #expect(throws: KeychainSaveFailed.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    #expect(destroyCalled.value == false)
+    #expect(session == .expired(expiredTokens))
   }
 }

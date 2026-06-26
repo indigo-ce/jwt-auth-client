@@ -276,6 +276,10 @@ do {
   // Token format is invalid
 } catch AuthTokens.Error.expiredToken {
   // Token has expired
+} catch AuthTokens.Error.refreshRejected {
+  // The refresh endpoint rejected the refresh token. Credentials have
+  // already been destroyed by `refreshExpiredTokens()`; redirect to login.
+  redirectToLogin()
 } catch KeychainError.savingFailed(let message) {
   // Keychain operation failed
   print("Keychain error: \(message)")
@@ -294,8 +298,12 @@ func handleTokenError(_ error: Error) async {
     try? await authClient.refreshExpiredTokens()
 
   case AuthTokens.Error.invalidToken,
-       AuthTokens.Error.missingToken:
-    // Clear invalid tokens and redirect to login
+       AuthTokens.Error.missingToken,
+       AuthTokens.Error.refreshRejected:
+    // Server definitively said the refresh token is no longer valid
+    // (or the stored tokens are missing/malformed). For `.refreshRejected`,
+    // `refreshExpiredTokens()` has already destroyed the credentials;
+    // the other cases need us to do it ourselves.
     try? await authTokensClient.destroy()
     redirectToLogin()
 
@@ -306,11 +314,19 @@ func handleTokenError(_ error: Error) async {
     redirectToLogin()
 
   default:
-    // Other errors
-    showError(error.localizedDescription)
+    // Transient failure (network, timeout, decode, etc.) — surface a
+    // retry option instead of wiping the still-valid session.
+    showRetryAlert(error: error) {
+      try? await authClient.refreshExpiredTokens()
+    }
   }
 }
 ```
+
+> ⚠️ **Important:** Do not call `authTokensClient.destroy()` from the
+> `default` branch. `refreshExpiredTokens()` already wipes the credentials
+> when the server explicitly rejects the refresh token, and a transient
+> network failure should preserve them so a later retry can succeed.
 
 ## Testing Token Management
 

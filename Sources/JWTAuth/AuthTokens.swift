@@ -63,6 +63,16 @@ extension AuthTokens {
     case invalidToken
     /// The token has expired and is no longer valid.
     case expiredToken
+    /// The refresh token was explicitly rejected by the server.
+    ///
+    /// Throw this from a `JWTAuthClient.refresh` closure to signal that the
+    /// server definitively rejected the refresh token — for example, a 401
+    /// from `/auth/refresh`, or a refresh token that has expired or been
+    /// revoked. `JWTAuthClient.refreshExpiredTokens()` catches this specific
+    /// case and destroys the stored credentials; any other thrown error is
+    /// treated as transient (the tokens are preserved so a later retry can
+    /// succeed) and rethrown to the caller.
+    case refreshRejected
 
     /// A localized message describing what error occurred.
     public var errorDescription: String? {
@@ -70,6 +80,7 @@ extension AuthTokens {
       case .missingToken: "The token seems to be missing."
       case .invalidToken: "The token is invalid."
       case .expiredToken: "The token is expired."
+      case .refreshRejected: "The refresh token was rejected by the server."
       }
     }
 
