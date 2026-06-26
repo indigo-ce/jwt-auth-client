@@ -185,7 +185,12 @@ extension JWTAuthClient {
   ///   unreachable, etc.) — the stored credentials are **left intact** so a
   ///   later retry can succeed. The error is rethrown so callers can decide
   ///   whether to surface a retry option instead of silently logging the user
-  ///   out.
+  ///   out. If `authTokensClient.set(newTokens)` was what actually threw (for
+  ///   example a keychain save failure), the in-memory session is rolled
+  ///   back to the old `.expired(tokens)` — the live `AuthTokensClient`
+  ///   writes new tokens to memory before attempting the keychain writes,
+  ///   so without this rollback memory would be left on the new tokens while
+  ///   the keychain is empty.
   ///
   /// In other words: only an explicit rejection from the server destroys the
   /// session. Anything else is treated as a transient hiccup and the user
@@ -240,9 +245,17 @@ extension JWTAuthClient {
         // `URLError.cannotConnectToHost`, `.notConnectedToInternet`,
         // `.timedOut`, DNS failures, decode errors, 5xx responses, etc.
         //
-        // Leave the existing tokens in place so a later retry can succeed,
-        // and rethrow so the caller can decide whether to surface a retry
-        // option rather than silently logging the user out.
+        // This branch also covers the `authTokensClient.set(newTokens)`
+        // step throwing — e.g. a keychain save failure. The live
+        // `AuthTokensClient` writes the new tokens to `@Shared(.authSession)`
+        // *before* attempting the keychain writes, so on `set` failure
+        // memory would otherwise be left on the new tokens even though the
+        // keychain is empty/partial. Roll the in-memory session back to the
+        // old `.expired(tokens)` so a later retry has the original refresh
+        // token to work with.
+        if session?.tokens != tokens {
+          $session.withLock { $0 = .expired(tokens) }
+        }
         throw error
       }
     }

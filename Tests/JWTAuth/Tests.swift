@@ -536,11 +536,17 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   }
 }
 
-@Test func refreshExpiredTokensKeepsTokensOnKeychainSaveFailureAfterRefresh() async throws {
+@Test func refreshExpiredTokensRollsBackSessionOnKeychainSaveFailureAfterRefresh() async throws {
   // Refresh succeeded, but persisting the new tokens to the keychain failed.
   // That's not a server-side rejection — the refresh token is still valid —
   // so we must NOT destroy, must rethrow the keychain error, and must leave
   // the existing (expired) tokens intact so a later retry can succeed.
+  //
+  // Critically, the live `AuthTokensClient.persist` writes the new tokens
+  // to `@Shared(.authSession)` *before* attempting the keychain writes.
+  // Without an explicit rollback, memory would be left on the new tokens
+  // while the keychain is empty — defeating the retry behavior. This mock
+  // reproduces that order so we can verify the rollback actually runs.
   struct KeychainSaveFailed: Error {}
 
   let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
@@ -558,7 +564,14 @@ private final class Box<T: Sendable>: @unchecked Sendable {
       reset: {}
     )
     $0.authTokensClient = .init(
-      save: { _ in throw KeychainSaveFailed() },
+      save: { newTokens in
+        // Simulate live persist order: mutate memory first, then throw on
+        // the keychain write. Without rollback, `session` would be left
+        // on `newTokens` even though the keychain is empty.
+        @Shared(.authSession) var session
+        $session.withLock { $0 = newTokens.toSession() }
+        throw KeychainSaveFailed()
+      },
       destroy: { destroyCalled.value = true }
     )
     $0.jwtAuthClient = client
@@ -571,6 +584,8 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     }
 
     #expect(destroyCalled.value == false)
+    // The in-memory session must be rolled back to the old expired tokens
+    // so a later retry can use the still-valid refresh token.
     #expect(session == .expired(expiredTokens))
   }
 }
