@@ -103,18 +103,26 @@ extension AuthTokensClient: DependencyKey {
 
     @Sendable
     func persist(_ tokens: AuthTokens?) async throws {
-      // Set the tokens in memory cache
+      // Set the tokens in memory cache. We do this before the keychain
+      // writes so the in-memory session and persistent state both reflect
+      // the new tokens on success.
       @Shared(.authSession) var session
       $session.withLock { $0 = tokens?.toSession() }
 
-      // Delete the tokens from the keychain
-      try await keychainClient.delete(.accessToken)
-      try await keychainClient.delete(.refreshToken)
-
-      // Save the tokens to the keychain
+      // Save the new tokens to the keychain BEFORE deleting the old ones.
+      // `keychainClient.save` replaces any existing entry in place, so on
+      // a partial save failure the old tokens remain in the keychain and
+      // a later retry can succeed. The previous delete-then-save order
+      // wiped both keychain entries before the first save, so any save
+      // failure left the keychain empty and silently logged the user out
+      // on the next cold launch.
       if let tokens {
         try await keychainClient.save(tokens.access, .accessToken)
         try await keychainClient.save(tokens.refresh, .refreshToken)
+      } else {
+        // No tokens to save — destroy removes both entries explicitly.
+        try await keychainClient.delete(.accessToken)
+        try await keychainClient.delete(.refreshToken)
       }
     }
 

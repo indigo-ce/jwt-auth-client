@@ -589,3 +589,103 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     #expect(session == .expired(expiredTokens))
   }
 }
+
+@Test func authTokensClientLiveValueSavePreservesOldRefreshOnAccessSaveFailure() async throws {
+  // The live `AuthTokensClient.persist` no longer pre-deletes the
+  // existing keychain entries before saving the new ones. So if the
+  // first save (access token) fails mid-write, the old refresh token
+  // is still in the keychain — letting a later retry succeed and
+  // avoiding a silent logout on the next cold launch. The previous
+  // delete-then-save order left the keychain completely empty on the
+  // same failure, which is what made the cold-launch case a problem.
+  struct AccessSaveFailed: Error {}
+
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+  // Track what's currently in the keychain. We mimic the live
+  // `keychainClient.save` semantics (delete-then-set on the underlying
+  // store) so this test exercises the same partial-failure shape the
+  // real keychain would produce.
+  let storedValues = Box<[KeychainClient.Keys: String]>([
+    .accessToken: oldTokens.access,
+    .refreshToken: oldTokens.refresh,
+  ])
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { value, key in
+        if storedValues.value[key] != nil {
+          storedValues.value[key] = nil
+        }
+        if key == .accessToken {
+          throw AccessSaveFailed()
+        }
+        storedValues.value[key] = value
+      },
+      load: { key in storedValues.value[key] },
+      delete: { key in storedValues.value[key] = nil },
+      reset: { storedValues.value.removeAll() }
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+
+    await #expect(throws: AccessSaveFailed.self) {
+      try await authTokensClient.save(newTokens)
+    }
+
+    // The access-token save failed mid-way, but the refresh-token save
+    // was never attempted — so the old refresh token is still in the
+    // keychain. With the old delete-then-save persist order the
+    // pre-delete would have wiped both entries first and the keychain
+    // would be empty here.
+    #expect(storedValues.value[.refreshToken] == oldTokens.refresh)
+  }
+}
+
+@Test func authTokensClientLiveValueSaveKeepsNewAccessOnRefreshSaveFailure() async throws {
+  // Companion to the access-save-failure test: when the second save
+  // (refresh token) fails, the access-token save has already
+  // succeeded, so the keychain holds the new access token. That's
+  // strictly better than the previous "keychain empty" outcome, even
+  // though it's a partial state — a later retry on the refresh path
+  // will overwrite the access token again.
+  struct RefreshSaveFailed: Error {}
+
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+  let storedValues = Box<[KeychainClient.Keys: String]>([
+    .accessToken: oldTokens.access,
+    .refreshToken: oldTokens.refresh,
+  ])
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { value, key in
+        if storedValues.value[key] != nil {
+          storedValues.value[key] = nil
+        }
+        storedValues.value[key] = value
+        if key == .refreshToken {
+          throw RefreshSaveFailed()
+        }
+      },
+      load: { key in storedValues.value[key] },
+      delete: { key in storedValues.value[key] = nil },
+      reset: { storedValues.value.removeAll() }
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+
+    await #expect(throws: RefreshSaveFailed.self) {
+      try await authTokensClient.save(newTokens)
+    }
+
+    // Access-token save completed before the refresh-token save
+    // threw, so the new access token is in the keychain. This is
+    // unchanged by the persist reorder — but verifying it here keeps
+    // the new behavior on a single set of assumptions.
+    #expect(storedValues.value[.accessToken] == newTokens.access)
+  }
+}
