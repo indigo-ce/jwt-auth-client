@@ -103,18 +103,46 @@ extension AuthTokensClient: DependencyKey {
 
     @Sendable
     func persist(_ tokens: AuthTokens?) async throws {
-      // Set the tokens in memory cache
+      // Set the tokens in memory cache. We do this before the keychain
+      // writes so the in-memory session and persistent state both reflect
+      // the new tokens on success.
       @Shared(.authSession) var session
       $session.withLock { $0 = tokens?.toSession() }
 
-      // Delete the tokens from the keychain
-      try await keychainClient.delete(.accessToken)
-      try await keychainClient.delete(.refreshToken)
-
-      // Save the tokens to the keychain
       if let tokens {
-        try await keychainClient.save(tokens.access, .accessToken)
-        try await keychainClient.save(tokens.refresh, .refreshToken)
+        // Capture the old values so we can restore them on a partial
+        // save failure. `keychainClient.save` does its own delete-then-
+        // set under the hood, so a set-throw after the internal delete
+        // leaves the corresponding entry empty. Restoring on failure
+        // keeps the keychain in a cold-launch-restorable state — the
+        // next `loadTokens()` returns the old pair (or nil if there
+        // were none originally) instead of nil because one of the
+        // new saves was mid-write.
+        let oldAccess = try? await keychainClient.load(.accessToken)
+        let oldRefresh = try? await keychainClient.load(.refreshToken)
+
+        do {
+          try await keychainClient.save(tokens.access, .accessToken)
+          try await keychainClient.save(tokens.refresh, .refreshToken)
+        } catch {
+          // Best-effort restore the old values. Use `try?` so a
+          // restore failure doesn't mask the original error.
+          if let oldAccess {
+            try? await keychainClient.save(oldAccess, .accessToken)
+          } else {
+            try? await keychainClient.delete(.accessToken)
+          }
+          if let oldRefresh {
+            try? await keychainClient.save(oldRefresh, .refreshToken)
+          } else {
+            try? await keychainClient.delete(.refreshToken)
+          }
+          throw error
+        }
+      } else {
+        // No tokens to save — destroy removes both entries explicitly.
+        try await keychainClient.delete(.accessToken)
+        try await keychainClient.delete(.refreshToken)
       }
     }
 

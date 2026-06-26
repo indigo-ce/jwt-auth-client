@@ -155,19 +155,23 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   #expect(AuthTokens.Error.missingToken.errorDescription == "The token seems to be missing.")
   #expect(AuthTokens.Error.invalidToken.errorDescription == "The token is invalid.")
   #expect(AuthTokens.Error.expiredToken.errorDescription == "The token is expired.")
+  #expect(AuthTokens.Error.refreshRejected.errorDescription == "The refresh token was rejected by the server.")
 }
 
 @Test func authTokensErrorTitle() {
   #expect(AuthTokens.Error.missingToken.title == "Session Error")
   #expect(AuthTokens.Error.invalidToken.title == "Session Error")
   #expect(AuthTokens.Error.expiredToken.title == "Session Error")
+  #expect(AuthTokens.Error.refreshRejected.title == "Session Error")
 }
 
 @Test func authTokensErrorEquality() {
   #expect(AuthTokens.Error.missingToken == AuthTokens.Error.missingToken)
   #expect(AuthTokens.Error.invalidToken == AuthTokens.Error.invalidToken)
   #expect(AuthTokens.Error.expiredToken == AuthTokens.Error.expiredToken)
+  #expect(AuthTokens.Error.refreshRejected == AuthTokens.Error.refreshRejected)
   #expect(AuthTokens.Error.missingToken != AuthTokens.Error.invalidToken)
+  #expect(AuthTokens.Error.refreshRejected != AuthTokens.Error.expiredToken)
 }
 
 // MARK: - AuthSession Tests
@@ -412,12 +416,57 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   }
 }
 
-@Test func refreshExpiredTokensDestroysTokensWhenRefreshFails() async throws {
+@Test func refreshExpiredTokensDestroysTokensWhenRefreshRejected() async throws {
   let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
   let destroyCalled = Box(false)
+  let saveCalled = Box(false)
   let client = JWTAuthClient(
     baseURL: { "https://api.example.com" },
-    refresh: { _ in throw AuthTokens.Error.invalidToken }
+    refresh: { _ in throw AuthTokens.Error.refreshRejected }
+  )
+  try await withDependencies {
+    // Use a wrapping `AuthTokensClient` so we can observe `destroy`/`save`
+    // being called while still delegating to the live impl (which is what
+    // actually updates `@Shared(.authSession)` and the keychain).
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(
+      save: { tokens in
+        saveCalled.value = true
+        try await AuthTokensClient.liveValue.save(tokens)
+      },
+      destroy: {
+        destroyCalled.value = true
+        try await AuthTokensClient.liveValue.destroy()
+      }
+    )
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(expiredTokens) }
+
+    // Server-side rejection: refreshExpiredTokens() should call destroy()
+    // and NOT rethrow — so `sendAuthenticated` can keep falling through to
+    // its existing `session?.tokens` check.
+    try await client.refreshExpiredTokens()
+
+    #expect(destroyCalled.value == true)
+    #expect(saveCalled.value == false)
+    #expect(session == nil)
+  }
+}
+
+@Test func refreshExpiredTokensKeepsTokensOnTransportError() async throws {
+  let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
+  let destroyCalled = Box(false)
+  let saveCalled = Box(false)
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in throw URLError(.notConnectedToInternet) }
   )
   try await withDependencies {
     $0.keychainClient = KeychainClient(
@@ -426,12 +475,276 @@ private final class Box<T: Sendable>: @unchecked Sendable {
       delete: { _ in },
       reset: {}
     )
-    $0.authTokensClient = .init(save: { _ in }, destroy: { destroyCalled.value = true })
+    $0.authTokensClient = .init(
+      save: { _ in saveCalled.value = true },
+      destroy: { destroyCalled.value = true }
+    )
     $0.jwtAuthClient = client
   } operation: {
     @Shared(.authSession) var session
     $session.withLock { $0 = .expired(expiredTokens) }
-    try await client.refreshExpiredTokens()
-    #expect(destroyCalled.value == true)
+
+    // Network unreachable is a transient failure: refreshExpiredTokens()
+    // must NOT destroy the tokens, must rethrow the URLError so the caller
+    // can decide to retry, and must leave the session untouched so a later
+    // retry can succeed.
+    await #expect(throws: URLError.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    #expect(destroyCalled.value == false)
+    #expect(saveCalled.value == false)
+    #expect(session == .expired(expiredTokens))
+  }
+}
+
+@Test func refreshExpiredTokensKeepsTokensOnGenericError() async throws {
+  struct NotAServerRejection: Error, Equatable {}
+
+  let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
+  let destroyCalled = Box(false)
+  let saveCalled = Box(false)
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in throw NotAServerRejection() }
+  )
+  try await withDependencies {
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(
+      save: { _ in saveCalled.value = true },
+      destroy: { destroyCalled.value = true }
+    )
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(expiredTokens) }
+
+    // Any non-`.refreshRejected` error is transient: same expectations as
+    // the URLError case.
+    await #expect(throws: NotAServerRejection.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    #expect(destroyCalled.value == false)
+    #expect(saveCalled.value == false)
+    #expect(session == .expired(expiredTokens))
+  }
+}
+
+@Test func refreshExpiredTokensRollsBackSessionOnKeychainSaveFailureAfterRefresh() async throws {
+  // Refresh succeeded, but persisting the new tokens to the keychain failed.
+  // That's not a server-side rejection — the refresh token is still valid —
+  // so we must NOT destroy, must rethrow the keychain error, and must leave
+  // the existing (expired) tokens intact so a later retry can succeed.
+  //
+  // Critically, the live `AuthTokensClient.persist` writes the new tokens
+  // to `@Shared(.authSession)` *before* attempting the keychain writes.
+  // Without an explicit rollback, memory would be left on the new tokens
+  // while the keychain is empty — defeating the retry behavior. This mock
+  // reproduces that order so we can verify the rollback actually runs.
+  struct KeychainSaveFailed: Error {}
+
+  let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
+  let destroyCalled = Box(false)
+  let newTokens = AuthTokens(access: validJWT, refresh: "new-refresh")
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in newTokens }
+  )
+  await withDependencies {
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(
+      save: { newTokens in
+        // Simulate live persist order: mutate memory first, then throw on
+        // the keychain write. Without rollback, `session` would be left
+        // on `newTokens` even though the keychain is empty.
+        @Shared(.authSession) var session
+        $session.withLock { $0 = newTokens.toSession() }
+        throw KeychainSaveFailed()
+      },
+      destroy: { destroyCalled.value = true }
+    )
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(expiredTokens) }
+
+    await #expect(throws: KeychainSaveFailed.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    #expect(destroyCalled.value == false)
+    // The in-memory session must be rolled back to the old expired tokens
+    // so a later retry can use the still-valid refresh token.
+    #expect(session == .expired(expiredTokens))
+  }
+}
+
+@Test func refreshExpiredTokensDoesNotResurrectSessionOnTransientRefreshFailure() async throws {
+  // The catch-and-rollback in `refreshExpiredTokens` must only run for
+  // failures from `authTokensClient.set(newTokens)`, NOT for failures
+  // from `refresh(tokens)`. Otherwise a concurrent session change
+  // (logout, new-user login) that lands while a refresh is in flight
+  // would be silently undone when the refresh later fails with a
+  // transient `URLError`. The mock here simulates that race by
+  // mutating the session from inside the `refresh` closure before
+  // throwing.
+  let userAExpired = AuthTokens(access: expiredJWT, refresh: "user-a-refresh")
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in
+      // Simulate the race: while this refresh is in flight, the
+      // user logs out (or another user logs in). The session is
+      // wiped to nil. The refresh then fails transiently.
+      @Shared(.authSession) var session
+      $session.withLock { $0 = nil }
+      throw URLError(.notConnectedToInternet)
+    }
+  )
+  await withDependencies {
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(save: { _ in }, destroy: {})
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(userAExpired) }
+
+    await #expect(throws: URLError.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    // The session must remain nil — the rollback that was previously
+    // triggered for any non-`.refreshRejected` error would have
+    // resurrected user A's old expired tokens here, undoing the
+    // logout. The split do-catch keeps the session change intact.
+    #expect(session == nil)
+  }
+}
+
+@Test func authTokensClientLiveValueSaveRestoresOldTokensOnAccessSaveFailure() async throws {
+  // When the access-token save fails mid-write, the live
+  // `AuthTokensClient.persist` captures the old access and refresh
+  // tokens up front and best-effort restores them on partial save
+  // failure. That keeps the keychain in a cold-launch-restorable
+  // state — the next `loadTokens()` returns the old pair (or nil
+  // if there were none originally) rather than nil because one of
+  // the new saves was mid-write. Without the restore, the
+  // `KeychainClient.save` delete-then-set would leave the access
+  // entry empty after the set-throw, and the user would still be
+  // silently logged out on the next launch.
+  struct AccessSaveFailed: Error {}
+
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+  // Track what's currently in the keychain. The stub mimics the
+  // live `keychainClient.save` semantics (delete-then-set on the
+  // underlying store) and throws *only* when the new value is being
+  // saved — the subsequent restore call with the old value is
+  // allowed to succeed.
+  let storedValues = Box<[KeychainClient.Keys: String]>([
+    .accessToken: oldTokens.access,
+    .refreshToken: oldTokens.refresh,
+  ])
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { value, key in
+        // Mimic live delete-then-set semantics.
+        storedValues.value[key] = nil
+        // Throw only on the new-value save; the restore call with
+        // the old value goes through cleanly.
+        if value == newTokens.access && key == .accessToken {
+          throw AccessSaveFailed()
+        }
+        storedValues.value[key] = value
+      },
+      load: { key in storedValues.value[key] },
+      delete: { key in storedValues.value[key] = nil },
+      reset: { storedValues.value.removeAll() }
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Dependency(\.keychainClient) var keychainClient
+
+    await #expect(throws: AccessSaveFailed.self) {
+      try await authTokensClient.save(newTokens)
+    }
+
+    // Both old tokens are back in the keychain — the access save
+    // was restored after the access-save failure, and the refresh
+    // was never touched. The keychain is cold-launch-restorable.
+    #expect(storedValues.value[.accessToken] == oldTokens.access)
+    #expect(storedValues.value[.refreshToken] == oldTokens.refresh)
+    let loaded = try await keychainClient.loadTokens()
+    #expect(loaded == oldTokens)
+  }
+}
+
+@Test func authTokensClientLiveValueSaveRestoresOldTokensOnRefreshSaveFailure() async throws {
+  // Companion case: when the access-token save succeeds but the
+  // refresh-token save fails, the live `AuthTokensClient.persist`
+  // best-effort restores the old refresh (and the old access,
+  // since the new access overwrote it). The keychain is left in a
+  // cold-launch-restorable state with the original old pair — not
+  // the new access + empty refresh that the partial fix would have
+  // left.
+  struct RefreshSaveFailed: Error {}
+
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+  let storedValues = Box<[KeychainClient.Keys: String]>([
+    .accessToken: oldTokens.access,
+    .refreshToken: oldTokens.refresh,
+  ])
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { value, key in
+        // Mimic live delete-then-set semantics.
+        storedValues.value[key] = nil
+        // Throw only on the new-value save; the subsequent restore
+        // call with the old value is allowed to succeed.
+        if value == newTokens.refresh && key == .refreshToken {
+          throw RefreshSaveFailed()
+        }
+        storedValues.value[key] = value
+      },
+      load: { key in storedValues.value[key] },
+      delete: { key in storedValues.value[key] = nil },
+      reset: { storedValues.value.removeAll() }
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Dependency(\.keychainClient) var keychainClient
+
+    await #expect(throws: RefreshSaveFailed.self) {
+      try await authTokensClient.save(newTokens)
+    }
+
+    // The new access save overwrote the old access, but the restore
+    // step put it back; the new refresh save failed before writing,
+    // so the old refresh was untouched. Keychain is the original
+    // old pair — cold-launch-restorable.
+    #expect(storedValues.value[.accessToken] == oldTokens.access)
+    #expect(storedValues.value[.refreshToken] == oldTokens.refresh)
+    let loaded = try await keychainClient.loadTokens()
+    #expect(loaded == oldTokens)
   }
 }

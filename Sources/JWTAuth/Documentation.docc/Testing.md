@@ -47,10 +47,15 @@ extension JWTAuthClient {
 
   static let successMock = mock()
 
+  /// Mock that simulates a definitive rejection from the refresh endpoint.
+  /// `refreshExpiredTokens()` will destroy the stored credentials.
   static let failureMock = mock(
-    refreshResult: .failure(AuthTokens.Error.expiredToken)
+    refreshResult: .failure(AuthTokens.Error.refreshRejected)
   )
 
+  /// Mock that simulates a transient network failure.
+  /// `refreshExpiredTokens()` will preserve the stored credentials and
+  /// rethrow the `URLError` so the caller can decide to retry.
   static let networkErrorMock = mock(
     refreshResult: .failure(URLError(.notConnectedToInternet))
   )
@@ -291,6 +296,9 @@ func testSessionConversion() {
 ```swift
 func testTokenRefreshFailure() async throws {
   await withDependencies {
+    // `.failureMock` throws `AuthTokens.Error.refreshRejected`, which
+    // `refreshExpiredTokens()` treats as a definitive rejection — it
+    // destroys the credentials and returns without throwing.
     $0.jwtAuthClient = .failureMock
     $0.authTokensClient = AuthTokensClient.mock()
   } operation: {
@@ -300,17 +308,44 @@ func testTokenRefreshFailure() async throws {
     // Set up expired session
     session = .expired(TestData.expiredTokens)
 
+    // `refreshExpiredTokens()` does NOT rethrow `.refreshRejected`; it
+    // destroys the session instead.
+    await XCTAssertNoThrowAsync {
+      try await authClient.refreshExpiredTokens()
+    }
+
+    // Verify session was cleared due to rejection
+    XCTAssertEqual(session, .missing)
+  }
+}
+```
+
+### Transient Refresh Failure Test
+
+```swift
+func testTransientRefreshFailure() async throws {
+  await withDependencies {
+    // `.networkErrorMock` throws a `URLError`. `refreshExpiredTokens()`
+    // treats this as transient: it preserves the credentials and rethrows.
+    $0.jwtAuthClient = .networkErrorMock
+    $0.authTokensClient = AuthTokensClient.mock()
+  } operation: {
+    @Dependency(\.jwtAuthClient) var authClient
+    @Shared(.authSession) var session
+
+    session = .expired(TestData.expiredTokens)
+
     do {
       try await authClient.refreshExpiredTokens()
-      XCTFail("Expected refresh to fail")
-    } catch AuthTokens.Error.expiredToken {
-      // Expected error
+      XCTFail("Expected network error")
+    } catch let error as URLError {
+      XCTAssertEqual(error.code, .notConnectedToInternet)
     } catch {
       XCTFail("Unexpected error: \(error)")
     }
 
-    // Verify session was cleared due to refresh failure
-    XCTAssertEqual(session, .missing)
+    // Session is preserved — a later retry can succeed.
+    XCTAssertEqual(session, .expired(TestData.expiredTokens))
   }
 }
 ```
