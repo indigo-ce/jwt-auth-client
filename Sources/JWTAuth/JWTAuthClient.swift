@@ -189,12 +189,18 @@ extension JWTAuthClient {
   ///   while the refresh is in flight is therefore preserved.
   /// - If `authTokensClient.set(newTokens)` throws (for example a keychain
   ///   save failure), the live `AuthTokensClient` restores the keychain to
-  ///   its previous state and never publishes the new tokens to
-  ///   `@Shared(.authSession)` in the first place — it writes the keychain
-  ///   first and updates memory only after both writes succeed. The
-  ///   in-memory session therefore still holds the old `.expired(tokens)`
-  ///   with the original refresh token, so a later retry can succeed, and
-  ///   the error is rethrown to the caller.
+  ///   its previous state, and this method publishes the new tokens to the
+  ///   in-memory session before rethrowing. The backend rotates refresh
+  ///   tokens and invalidates the old one immediately — there is no grace
+  ///   window — so the old tokens are already dead server-side and the new
+  ///   tokens are the only valid credentials held on device. Keeping them
+  ///   in memory lets the current session keep working (the new access
+  ///   token is valid), while the rethrown error still signals that
+  ///   persistence failed. The publish is guarded: it only fires when the
+  ///   session still holds the old tokens, so a concurrent logout or
+  ///   account switch that lands during the save is never overwritten.
+  ///   After an app restart the persisted (old) tokens will fail to
+  ///   refresh and the user will be asked to sign in again.
   ///
   /// In other words: only an explicit rejection from the server destroys the
   /// session. Anything else is treated as a transient hiccup and the user
@@ -204,9 +210,9 @@ extension JWTAuthClient {
   ///   - ``AuthTokens/Error/missingToken`` if no tokens are available.
   ///   - Any error thrown by `refresh` (other than ``AuthTokens/Error/refreshRejected``)
   ///     — see "Error handling" above.
-  ///   - Any error thrown by `authTokensClient.set(newTokens)`. The in-memory
-  ///     session is untouched in that case — the live `AuthTokensClient`
-  ///     publishes to memory only after the keychain writes succeed.
+  ///   - Any error thrown by `authTokensClient.set(newTokens)`. In that case
+  ///     the session is moved to the new tokens (guarded so a concurrent
+  ///     session change wins) before the error is rethrown.
   ///
   /// ## Usage
   ///
@@ -256,14 +262,29 @@ extension JWTAuthClient {
         throw error
       }
 
-      // Step 2: persist the new tokens. The live `AuthTokensClient` writes
-      // the keychain first and publishes the new session to memory only
-      // after both writes succeed, so a persist failure leaves the
-      // in-memory session on the old (expired) tokens — the original
-      // refresh token survives for a later retry. No rollback is needed
-      // (or performed) here, and a concurrent session change that lands
-      // while the write is in flight is never overwritten.
-      try await authTokensClient.set(newTokens)
+      // Step 2: persist the new tokens. On success the live
+      // `AuthTokensClient` has written the keychain and published the new
+      // session to memory. On failure (e.g. a keychain save error) the
+      // keychain is restored to its previous state, but the old tokens are
+      // already dead server-side — the backend rotates the refresh token
+      // and invalidates the old one immediately, with no grace window — so
+      // the new tokens are the only valid credentials on device. Publish
+      // them to memory anyway (best-effort, session-only) so the user
+      // isn't logged out by a storage failure, and rethrow so the caller
+      // still knows persistence failed. The publish is guarded and atomic:
+      // it only fires when the session still holds the old tokens, so a
+      // concurrent logout or account switch that lands during the save is
+      // never overwritten.
+      do {
+        try await authTokensClient.set(newTokens)
+      } catch {
+        $session.withLock { current in
+          if current?.tokens == tokens {
+            current = newTokens.toSession()
+          }
+        }
+        throw error
+      }
     }
   }
 

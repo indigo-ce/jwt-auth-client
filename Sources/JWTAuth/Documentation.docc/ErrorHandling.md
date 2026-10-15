@@ -11,9 +11,12 @@ silently and permanently logged the user out.
 
 The new contract introduces ``AuthTokens/Error/refreshRejected`` as the
 **explicit** signal for "the server definitively rejected the refresh
-token." Only that case destroys credentials; anything else (network
-errors, decode errors, keychain save failures, etc.) is rethrown and
-preserves the stored tokens so a later retry can succeed.
+token." Only that case destroys credentials; anything else is rethrown.
+A refresh-path failure (network errors, decode errors, etc.) preserves
+the stored tokens so a later retry can succeed. A keychain save failure
+after a *successful* refresh instead keeps the freshly refreshed tokens
+in memory — the old refresh token is already invalidated server-side —
+and rethrows; see ``JWTAuthClient/refreshExpiredTokens()`` for details.
 
 ### Before (any error → destroy)
 

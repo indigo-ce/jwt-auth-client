@@ -536,17 +536,21 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   }
 }
 
-@Test func refreshExpiredTokensKeepsOldSessionOnKeychainSaveFailureAfterRefresh() async throws {
+@Test func refreshExpiredTokensKeepsNewTokensInMemoryOnKeychainSaveFailureAfterRefresh() async throws {
   // Refresh succeeded, but persisting the new tokens to the keychain failed.
-  // That's not a server-side rejection — the refresh token is still valid —
-  // so we must NOT destroy, must rethrow the keychain error, and must leave
-  // the existing (expired) tokens intact so a later retry can succeed.
+  // That's not a server-side rejection, so we must NOT destroy and must
+  // rethrow the keychain error. But the backend rotates refresh tokens and
+  // invalidates the old one immediately (no grace window), so the old
+  // expired tokens are already dead server-side — leaving them in memory
+  // would make the next refresh a guaranteed 401 that destroys the
+  // session. The new tokens are the only valid credentials on device, so
+  // `refreshExpiredTokens` publishes them to memory (best-effort,
+  // session-only) before rethrowing.
   //
-  // The live `AuthTokensClient` writes the keychain first and publishes to
-  // `@Shared(.authSession)` only after both writes succeed, so the failed
-  // persist leaves the in-memory session untouched — `refreshExpiredTokens`
-  // needs no explicit rollback (and no longer performs one). This test wires
-  // the real live persist path to a failing keychain to pin that contract.
+  // This test wires the real live persist path to a failing keychain: the
+  // live persist restores the keychain and leaves memory untouched, and
+  // the guarded publish in `refreshExpiredTokens` then moves the session
+  // onto the new tokens.
   struct KeychainSaveFailed: Error {}
 
   let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
@@ -581,9 +585,60 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     }
 
     #expect(destroyCalled.value == false)
-    // The in-memory session must still hold the old expired tokens so a
-    // later retry can use the still-valid refresh token.
-    #expect(session == .expired(expiredTokens))
+    // The session must hold the new tokens — the only valid credentials
+    // left — so the current session keeps working despite the failed
+    // persist.
+    #expect(session == .valid(newTokens))
+  }
+}
+
+@Test func refreshExpiredTokensDoesNotOverwriteConcurrentSessionChangeOnKeychainSaveFailure() async throws {
+  // The guarded publish on keychain-save failure must only fire when the
+  // session still holds the old tokens. If a concurrent logout or account
+  // switch lands while the failing save is in flight, that change wins —
+  // the publish must not overwrite it with the new tokens. This mock
+  // performs the concurrent change from inside the save closure, before
+  // the persist throws.
+  struct KeychainSaveFailed: Error {}
+
+  let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
+  let userBTokens = AuthTokens(access: validJWT, refresh: "user-b-refresh")
+  let newTokens = AuthTokens(access: validJWT, refresh: "new-refresh")
+  let client = JWTAuthClient(
+    baseURL: { "https://api.example.com" },
+    refresh: { _ in newTokens }
+  )
+  await withDependencies {
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in throw KeychainSaveFailed() },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+    $0.authTokensClient = .init(
+      save: { tokens in
+        // Simulate the race: while the persist is failing, user B signs
+        // in on another task and takes over the session.
+        @Shared(.authSession) var session
+        $session.withLock { $0 = .expired(userBTokens) }
+        // The live persist touches only the keychain (and leaves memory
+        // untouched on failure), so user B's session survives it.
+        try await AuthTokensClient.liveValue.save(tokens)
+      },
+      destroy: {}
+    )
+    $0.jwtAuthClient = client
+  } operation: {
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(expiredTokens) }
+
+    await #expect(throws: KeychainSaveFailed.self) {
+      try await client.refreshExpiredTokens()
+    }
+
+    // User B's concurrent session change wins — the guarded publish must
+    // not overwrite it with the refreshed tokens.
+    #expect(session == .expired(userBTokens))
   }
 }
 
