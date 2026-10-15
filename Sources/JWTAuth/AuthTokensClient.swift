@@ -34,9 +34,16 @@ public struct AuthTokensClient: Sendable {
   /// Saves authentication tokens to persistent storage and updates the in-memory session.
   ///
   /// This operation:
-  /// 1. Updates the shared session state in memory
-  /// 2. Removes any existing tokens from keychain
-  /// 3. Saves the new tokens to keychain
+  /// 1. Saves the new tokens to keychain, best-effort restoring the previous
+  ///    values if a write fails
+  /// 2. Updates the shared session state in memory once both keychain writes
+  ///    have succeeded
+  ///
+  /// The in-memory session is published only after the tokens are durably
+  /// persisted. If a keychain write fails, the keychain is restored to its
+  /// previous state, the in-memory session is left untouched, and the error
+  /// is thrown — observers of `@Shared(.authSession)` never see tokens that
+  /// aren't persisted.
   ///
   /// - Parameter tokens: The authentication tokens to save
   /// - Throws: An error if the keychain operation fails
@@ -103,13 +110,15 @@ extension AuthTokensClient: DependencyKey {
 
     @Sendable
     func persist(_ tokens: AuthTokens?) async throws {
-      // Set the tokens in memory cache. We do this before the keychain
-      // writes so the in-memory session and persistent state both reflect
-      // the new tokens on success.
       @Shared(.authSession) var session
-      $session.withLock { $0 = tokens?.toSession() }
 
       if let tokens {
+        // Write the keychain first and publish the in-memory session only
+        // after both writes succeed. This keeps `@Shared(.authSession)` a
+        // "durably persisted" signal: observers (e.g. a root view that
+        // dismisses the auth sheet when a valid session appears) never see
+        // tokens that failed to persist.
+        //
         // Capture the old values so we can restore them on a partial
         // save failure. `keychainClient.save` does its own delete-then-
         // set under the hood, so a set-throw after the internal delete
@@ -139,8 +148,15 @@ extension AuthTokensClient: DependencyKey {
           }
           throw error
         }
+
+        // Both keychain writes succeeded — publish to memory now. On any
+        // failure above, the in-memory session is left untouched.
+        $session.withLock { $0 = tokens.toSession() }
       } else {
-        // No tokens to save — destroy removes both entries explicitly.
+        // Destroy clears the in-memory session first so observers see the
+        // logout immediately, then removes both keychain entries explicitly.
+        $session.withLock { $0 = nil }
+
         try await keychainClient.delete(.accessToken)
         try await keychainClient.delete(.refreshToken)
       }

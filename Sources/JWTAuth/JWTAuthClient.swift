@@ -188,14 +188,13 @@ extension JWTAuthClient {
   ///   out. A concurrent session change (logout, new-user login) that lands
   ///   while the refresh is in flight is therefore preserved.
   /// - If `authTokensClient.set(newTokens)` throws (for example a keychain
-  ///   save failure), the in-memory session is rolled back to the old
-  ///   `.expired(tokens)` — the live `AuthTokensClient` writes the new tokens
-  ///   to `@Shared(.authSession)` before attempting the keychain writes, so
-  ///   without this rollback memory would be left on the new tokens while the
-  ///   keychain is partial. The check-and-rollback is performed atomically
-  ///   via `withLock` so a concurrent session change observed during the
-  ///   catch is not overwritten — we only roll back when the session still
-  ///   holds the new tokens we just persisted.
+  ///   save failure), the live `AuthTokensClient` restores the keychain to
+  ///   its previous state and never publishes the new tokens to
+  ///   `@Shared(.authSession)` in the first place — it writes the keychain
+  ///   first and updates memory only after both writes succeed. The
+  ///   in-memory session therefore still holds the old `.expired(tokens)`
+  ///   with the original refresh token, so a later retry can succeed, and
+  ///   the error is rethrown to the caller.
   ///
   /// In other words: only an explicit rejection from the server destroys the
   /// session. Anything else is treated as a transient hiccup and the user
@@ -205,8 +204,9 @@ extension JWTAuthClient {
   ///   - ``AuthTokens/Error/missingToken`` if no tokens are available.
   ///   - Any error thrown by `refresh` (other than ``AuthTokens/Error/refreshRejected``)
   ///     — see "Error handling" above.
-  ///   - Any error thrown by `authTokensClient.set(newTokens)`, after rolling
-  ///     back the in-memory session.
+  ///   - Any error thrown by `authTokensClient.set(newTokens)`. The in-memory
+  ///     session is untouched in that case — the live `AuthTokensClient`
+  ///     publishes to memory only after the keychain writes succeed.
   ///
   /// ## Usage
   ///
@@ -256,26 +256,14 @@ extension JWTAuthClient {
         throw error
       }
 
-      // Step 2: persist the new tokens. The live `AuthTokensClient`
-      // writes the new tokens to `@Shared(.authSession)` *before*
-      // attempting the keychain writes, so on `set` failure memory
-      // would otherwise be left on the new tokens even though the
-      // keychain is partial. Roll the in-memory session back to the
-      // old `.expired(tokens)` so a later retry has the original
-      // refresh token to work with — but only if the session still
-      // holds the new tokens we just persisted. withLock makes the
-      // check-and-set atomic so a concurrent session change observed
-      // during the catch is not overwritten.
-      do {
-        try await authTokensClient.set(newTokens)
-      } catch {
-        $session.withLock { current in
-          if current?.tokens == newTokens {
-            current = .expired(tokens)
-          }
-        }
-        throw error
-      }
+      // Step 2: persist the new tokens. The live `AuthTokensClient` writes
+      // the keychain first and publishes the new session to memory only
+      // after both writes succeed, so a persist failure leaves the
+      // in-memory session on the old (expired) tokens — the original
+      // refresh token survives for a later retry. No rollback is needed
+      // (or performed) here, and a concurrent session change that lands
+      // while the write is in flight is never overwritten.
+      try await authTokensClient.set(newTokens)
     }
   }
 

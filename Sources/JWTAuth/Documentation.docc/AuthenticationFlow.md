@@ -148,9 +148,13 @@ Token refresh is handled automatically by the `sendAuthenticated` methods. Howev
   through `refreshExpiredTokens` directly — which currently swallows it and
   lets `session?.tokens` go nil), or simply by watching `@Shared(.authSession)`.
 - **Any other error** — a transient failure (no network, timeout, decode
-  error, etc.). The stored credentials are **preserved**, and the error is
-  rethrown so you can show a retry option instead of silently logging the
-  user out.
+  error, keychain save failure, etc.). The stored credentials are
+  **preserved**, and the error is rethrown so you can show a retry option
+  instead of silently logging the user out. A keychain save failure is safe
+  here too: `AuthTokensClient.save` writes the keychain first and publishes
+  the session to memory only after both writes succeed, so the in-memory
+  session keeps the old tokens — including the original refresh token — and
+  the keychain is restored to its previous state.
 
 ```swift
 @Dependency(\.jwtAuthClient) var authClient

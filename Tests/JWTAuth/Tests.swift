@@ -536,17 +536,17 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   }
 }
 
-@Test func refreshExpiredTokensRollsBackSessionOnKeychainSaveFailureAfterRefresh() async throws {
+@Test func refreshExpiredTokensKeepsOldSessionOnKeychainSaveFailureAfterRefresh() async throws {
   // Refresh succeeded, but persisting the new tokens to the keychain failed.
   // That's not a server-side rejection — the refresh token is still valid —
   // so we must NOT destroy, must rethrow the keychain error, and must leave
   // the existing (expired) tokens intact so a later retry can succeed.
   //
-  // Critically, the live `AuthTokensClient.persist` writes the new tokens
-  // to `@Shared(.authSession)` *before* attempting the keychain writes.
-  // Without an explicit rollback, memory would be left on the new tokens
-  // while the keychain is empty — defeating the retry behavior. This mock
-  // reproduces that order so we can verify the rollback actually runs.
+  // The live `AuthTokensClient` writes the keychain first and publishes to
+  // `@Shared(.authSession)` only after both writes succeed, so the failed
+  // persist leaves the in-memory session untouched — `refreshExpiredTokens`
+  // needs no explicit rollback (and no longer performs one). This test wires
+  // the real live persist path to a failing keychain to pin that contract.
   struct KeychainSaveFailed: Error {}
 
   let expiredTokens = AuthTokens(access: expiredJWT, refresh: "refresh")
@@ -558,19 +558,16 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   )
   await withDependencies {
     $0.keychainClient = KeychainClient(
-      save: { _, _ in },
+      save: { _, _ in throw KeychainSaveFailed() },
       load: { _ in nil },
       delete: { _ in },
       reset: {}
     )
     $0.authTokensClient = .init(
-      save: { newTokens in
-        // Simulate live persist order: mutate memory first, then throw on
-        // the keychain write. Without rollback, `session` would be left
-        // on `newTokens` even though the keychain is empty.
-        @Shared(.authSession) var session
-        $session.withLock { $0 = newTokens.toSession() }
-        throw KeychainSaveFailed()
+      save: { tokens in
+        // Delegate to the live implementation so the keychain-first
+        // ordering (and the untouched memory on failure) is exercised.
+        try await AuthTokensClient.liveValue.save(tokens)
       },
       destroy: { destroyCalled.value = true }
     )
@@ -584,16 +581,16 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     }
 
     #expect(destroyCalled.value == false)
-    // The in-memory session must be rolled back to the old expired tokens
-    // so a later retry can use the still-valid refresh token.
+    // The in-memory session must still hold the old expired tokens so a
+    // later retry can use the still-valid refresh token.
     #expect(session == .expired(expiredTokens))
   }
 }
 
 @Test func refreshExpiredTokensDoesNotResurrectSessionOnTransientRefreshFailure() async throws {
-  // The catch-and-rollback in `refreshExpiredTokens` must only run for
-  // failures from `authTokensClient.set(newTokens)`, NOT for failures
-  // from `refresh(tokens)`. Otherwise a concurrent session change
+  // A failure thrown from `refresh(tokens)` is a transient refresh failure:
+  // `refreshExpiredTokens` must not destroy, publish, or otherwise mutate
+  // the session in response. Otherwise a concurrent session change
   // (logout, new-user login) that lands while a refresh is in flight
   // would be silently undone when the refresh later fails with a
   // transient `URLError`. The mock here simulates that race by
@@ -628,10 +625,10 @@ private final class Box<T: Sendable>: @unchecked Sendable {
       try await client.refreshExpiredTokens()
     }
 
-    // The session must remain nil — the rollback that was previously
-    // triggered for any non-`.refreshRejected` error would have
-    // resurrected user A's old expired tokens here, undoing the
-    // logout. The split do-catch keeps the session change intact.
+    // The session must remain nil — any rollback-style recovery keyed on
+    // the pre-refresh tokens would resurrect user A's old expired tokens
+    // here, undoing the logout. No such recovery runs for refresh-path
+    // failures.
     #expect(session == nil)
   }
 }
@@ -681,6 +678,8 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   } operation: {
     @Dependency(\.authTokensClient) var authTokensClient
     @Dependency(\.keychainClient) var keychainClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(oldTokens) }
 
     await #expect(throws: AccessSaveFailed.self) {
       try await authTokensClient.save(newTokens)
@@ -693,6 +692,9 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     #expect(storedValues.value[.refreshToken] == oldTokens.refresh)
     let loaded = try await keychainClient.loadTokens()
     #expect(loaded == oldTokens)
+    // Memory is published only after both keychain writes succeed, so
+    // the failed save left the in-memory session untouched.
+    #expect(session == .expired(oldTokens))
   }
 }
 
@@ -733,6 +735,8 @@ private final class Box<T: Sendable>: @unchecked Sendable {
   } operation: {
     @Dependency(\.authTokensClient) var authTokensClient
     @Dependency(\.keychainClient) var keychainClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(oldTokens) }
 
     await #expect(throws: RefreshSaveFailed.self) {
       try await authTokensClient.save(newTokens)
@@ -746,5 +750,110 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     #expect(storedValues.value[.refreshToken] == oldTokens.refresh)
     let loaded = try await keychainClient.loadTokens()
     #expect(loaded == oldTokens)
+    // Memory is published only after both keychain writes succeed, so
+    // the failed save left the in-memory session untouched.
+    #expect(session == .expired(oldTokens))
+  }
+}
+
+@Test func authTokensClientLiveValueSaveLeavesSessionUntouchedOnKeychainFailure() async throws {
+  // The live persist writes the keychain first and publishes the new
+  // session to `@Shared(.authSession)` only after both writes succeed.
+  // A failed save must therefore leave the in-memory session exactly as
+  // it was — observers (e.g. a root view that dismisses the auth sheet
+  // when a valid session appears) never see tokens that didn't persist.
+  struct SaveFailed: Error {}
+
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+
+  await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in throw SaveFailed() },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(oldTokens) }
+
+    await #expect(throws: SaveFailed.self) {
+      try await authTokensClient.save(newTokens)
+    }
+
+    #expect(session == .expired(oldTokens))
+  }
+}
+
+@Test func authTokensClientLiveValueSavePublishesSessionOnlyAfterKeychainWritesSucceed() async throws {
+  // Guard the ordering itself: while the keychain writes are in flight,
+  // memory still holds the old session; the new session is published only
+  // after the second write completes.
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+  let sessionDuringWrites = Box<AuthSession?>(nil)
+  let writesStarted = Box(0)
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in
+        writesStarted.value += 1
+        // Capture what memory holds while the keychain writes are
+        // still in progress (after the first of two writes).
+        if writesStarted.value == 1 {
+          @Shared(.authSession) var session
+          sessionDuringWrites.value = session
+        }
+      },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(oldTokens) }
+
+    try await authTokensClient.save(newTokens)
+
+    // While the writes were in flight, memory still held the old
+    // session; afterwards it holds the new one.
+    #expect(sessionDuringWrites.value == .expired(oldTokens))
+    #expect(session == newTokens.toSession())
+  }
+}
+
+@Test func authTokensClientLiveValueDestroyClearsSessionEvenWhenKeychainDeleteThrows() async throws {
+  // Destroy clears the in-memory session *first*, then removes the
+  // keychain entries. Even when the keychain delete fails, memory has
+  // already been cleared — the user is logged out of the session
+  // immediately.
+  struct DeleteFailed: Error {}
+
+  let tokens = AuthTokens(access: "access", refresh: "refresh")
+
+  await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { _ in nil },
+      delete: { _ in throw DeleteFailed() },
+      reset: {}
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .valid(tokens) }
+
+    await #expect(throws: DeleteFailed.self) {
+      try await authTokensClient.destroy()
+    }
+
+    // Memory was cleared before the keychain delete threw.
+    #expect(session == nil)
   }
 }
