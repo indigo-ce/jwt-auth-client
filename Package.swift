@@ -16,8 +16,11 @@ let package = Package(
       targets: ["JWTAuth"])
   ],
   dependencies: [
-    .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.11.0"),
-    .package(url: "https://github.com/pointfreeco/swift-sharing", from: "2.7.4"),
+    .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.17.1"),
+    // 2.9+ adopts the split swift-issue-reporting package (as does
+    // swift-dependencies 1.17+); 2.8.x fixes Xcode 27's link failure but
+    // still crashes at runtime under its @State macro.
+    .package(url: "https://github.com/pointfreeco/swift-sharing", from: "2.10.1"),
     .package(url: "https://github.com/auth0/JWTDecode.swift", from: "4.0.0"),
     .package(url: "https://github.com/auth0/SimpleKeychain", from: "1.3.0"),
     .package(url: "https://github.com/kean/Pulse.git", from: "5.1.4"),

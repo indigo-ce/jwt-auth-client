@@ -148,9 +148,24 @@ Token refresh is handled automatically by the `sendAuthenticated` methods. Howev
   through `refreshExpiredTokens` directly — which currently swallows it and
   lets `session?.tokens` go nil), or simply by watching `@Shared(.authSession)`.
 - **Any other error** — a transient failure (no network, timeout, decode
-  error, etc.). The stored credentials are **preserved**, and the error is
-  rethrown so you can show a retry option instead of silently logging the
-  user out.
+  error, keychain save failure, etc.). The error is rethrown so you can show
+  a retry option instead of silently logging the user out. Two sub-cases:
+  - If the `refresh` call itself failed (network, timeout, decode), the
+    stored credentials are **preserved** — the refresh token is still valid,
+    so a later retry can succeed.
+  - If the refresh succeeded but persisting the new tokens failed (for
+    example a keychain error), the keychain is best-effort restored to its
+    previous state, but the session still moves to the new tokens. Backends
+    that rotate refresh tokens and invalidate the old one immediately (like
+    the Indigo backend — no grace window) leave the old tokens dead
+    server-side, so the new tokens are the only valid credentials on
+    device: they live in memory for the rest of the session, and after an
+    app restart the persisted (old) tokens fail to refresh and the user
+    must sign in again. (A backend that keeps the old refresh token valid
+    instead lets the persisted tokens work after restart — publishing the
+    new tokens is safe either way, since they are valid credentials too.)
+    The publish is guarded: a concurrent logout or account switch that
+    lands during the save is never overwritten.
 
 ```swift
 @Dependency(\.jwtAuthClient) var authClient
@@ -223,8 +238,11 @@ do {
   // Server rejected the refresh token — credentials are gone.
   try await authTokensClient.destroy()
 } catch {
-  // Transient failure — leave the existing tokens alone so a later
-  // retry (next launch, next request, etc) can succeed.
+  // Transient failure. A refresh-path failure leaves the stored tokens
+  // alone so a retry can succeed; a keychain persist failure after a
+  // successful refresh instead keeps the new tokens in memory (the old
+  // refresh token is already invalidated server-side) and rethrows —
+  // see the bullets above.
   throw error
 }
 ```

@@ -65,7 +65,7 @@ The `AuthTokensClient` manages token persistence:
 ```swift
 @Dependency(\.authTokensClient) var authTokensClient
 
-// Save tokens (updates both memory and keychain)
+// Save tokens (persists to keychain, then publishes the session to memory)
 try await authTokensClient.save(tokens)
 
 // Destroy all tokens
@@ -74,6 +74,23 @@ try await authTokensClient.destroy()
 // Set tokens (save if not nil, destroy if nil)
 try await authTokensClient.set(optionalTokens)
 ```
+
+Both operations are ordered so observers of `@Shared(.authSession)` only ever
+see durable state:
+
+- `save` writes the keychain **first** and updates the shared session only
+  after both keychain writes succeed. If a keychain write fails, the
+  previous values are best-effort restored — restoration itself can fail,
+  in which case the keychain may be left without the previous credentials
+  and the user must sign in again — the in-memory session is left
+  untouched, and the error is thrown. The publication is also skipped if a
+  concurrent writer changed the session while the save was in flight, so a
+  `.valid` session event always reflects both durable persistence and the
+  latest session change.
+- `destroy` clears the in-memory session first so observers see the logout
+  immediately, then removes the keychain entries.
+- The live implementation serializes save and destroy operations, so a
+  concurrent logout can never interleave with an in-flight save.
 
 ### KeychainClient
 
