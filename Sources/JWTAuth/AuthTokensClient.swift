@@ -118,7 +118,7 @@ extension AuthTokensClient: TestDependencyKey {
 /// concurrent destroy can never interleave with an in-flight save (e.g.
 /// deleting the keychain entries between the save's writes and its session
 /// publication, or vice versa).
-private final class PersistSerialGate: @unchecked Sendable {
+final class PersistSerialGate: @unchecked Sendable {
   private let lock = NSLock()
   private var isRunning = false
   private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -154,10 +154,16 @@ private final class PersistSerialGate: @unchecked Sendable {
   }
 }
 
+/// Shared by the live `AuthTokensClient` (persist operations) and by
+/// `JWTAuthClient.loadSession`, so a session read can never interleave
+/// with an in-flight save or destroy — e.g. publishing stale keychain
+/// tokens while a sign-in save is still writing, or republishing tokens
+/// a destroy just removed.
+let persistGate = PersistSerialGate()
+
 extension AuthTokensClient: DependencyKey {
   public static let liveValue = { () -> AuthTokensClient in
     @Dependency(\.keychainClient) var keychainClient
-    let persistGate = PersistSerialGate()
 
     @Sendable
     func persist(_ tokens: AuthTokens?) async throws {

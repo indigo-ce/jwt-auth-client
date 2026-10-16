@@ -1039,3 +1039,207 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     #expect(session == newTokens.toSession())
   }
 }
+
+@Test func loadSessionDefersToInFlightSaveAndKeepsNewAccount() async throws {
+  // Sign-in starts while memory is empty and the keychain holds an
+  // earlier account. A concurrent startup `loadSession()` must not
+  // publish that earlier account: it waits on the shared persist gate,
+  // sees the save's freshly published session inside the gate, and
+  // becomes a no-op. Without the gate, the load would read the old
+  // account from the keychain mid-save and publish it over the new one.
+  //
+  // The save is parked before its first keychain write (old account
+  // still stored), and the load is parked inside its first keychain
+  // read — so in the ungated case the stale read provably interleaves
+  // with the in-flight save. In the gated case the load never reaches
+  // the keychain while the save is parked, and the bounded spin expires.
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: validJWT, refresh: "new-refresh")
+  let storedValues = Box<[KeychainClient.Keys: String]>([
+    .accessToken: oldTokens.access,
+    .refreshToken: oldTokens.refresh,
+  ])
+  let saveParked = Box(false)
+  let releaseSave = Box<CheckedContinuation<Void, Never>?>(nil)
+  let parkLoads = Box(false)
+  let loadParked = Box(false)
+  let releaseLoad = Box<CheckedContinuation<Void, Never>?>(nil)
+  let loadsWhileSaveParked = Box(0)
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { value, key in
+        // Park before the first write — the keychain still holds the
+        // old account while the save is suspended.
+        if !saveParked.value {
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseSave.value = continuation
+            saveParked.value = true
+          }
+        }
+        storedValues.value[key] = value
+      },
+      load: { key in
+        if saveParked.value {
+          // A keychain read while the save is parked can only come from
+          // a loadSession that bypassed the persist gate.
+          loadsWhileSaveParked.value += 1
+        }
+        if parkLoads.value {
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseLoad.value = continuation
+            loadParked.value = true
+          }
+        }
+        return storedValues.value[key]
+      },
+      delete: { key in storedValues.value[key] = nil },
+      reset: {}
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = nil }
+
+    let tokensClient = authTokensClient
+    let jwtClient = JWTAuthClient(
+      baseURL: { "https://api.example.com" },
+      refresh: { _ in .init(access: "access", refresh: "refresh") }
+    )
+
+    let saveTask = Task { try await tokensClient.save(newTokens) }
+
+    // Wait until the save is parked before its first keychain write.
+    while !saveParked.value {
+      await Task.yield()
+    }
+
+    // Start the load — the exact startup race.
+    parkLoads.value = true
+    let loadTask = Task { try await jwtClient.loadSession() }
+
+    // In the ungated case the load reaches the keychain and parks;
+    // in the gated case it waits on the persist gate and the bounded
+    // spin expires.
+    for _ in 0 ..< 2_000 where !loadParked.value {
+      await Task.yield()
+    }
+
+    if loadParked.value {
+      // Ungated only: let the stale read finish so its publication
+      // lands before the save's guarded one.
+      releaseLoad.value?.resume()
+      parkLoads.value = false
+      try await loadTask.value
+    }
+    parkLoads.value = false
+
+    releaseSave.value?.resume()
+    try await saveTask.value
+    try await loadTask.value
+
+    // Memory holds the new account, and the load deferred to the save —
+    // it never read the keychain while the save was in flight.
+    #expect(session == .valid(newTokens))
+    #expect(loadsWhileSaveParked.value == 0)
+  }
+}
+
+@Test func loadSessionDuringDestroyReadsClearedKeychainAndStaysLoggedOut() async throws {
+  // A `loadSession()` started while a destroy is parked before its
+  // first keychain delete must wait for the destroy to finish. Without
+  // the shared gate it would read the not-yet-deleted old tokens and
+  // republish them right after logout completed. Same parking
+  // structure as the in-flight-save test above.
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let storedValues = Box<[KeychainClient.Keys: String]>([
+    .accessToken: oldTokens.access,
+    .refreshToken: oldTokens.refresh,
+  ])
+  let destroyParked = Box(false)
+  let releaseDestroy = Box<CheckedContinuation<Void, Never>?>(nil)
+  let parkLoads = Box(false)
+  let loadParked = Box(false)
+  let releaseLoad = Box<CheckedContinuation<Void, Never>?>(nil)
+  let loadsWhileParked = Box(0)
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in },
+      load: { key in
+        if destroyParked.value {
+          // A keychain read while the destroy is parked can only come
+          // from a loadSession that bypassed the gate.
+          loadsWhileParked.value += 1
+        }
+        if parkLoads.value {
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseLoad.value = continuation
+            loadParked.value = true
+          }
+        }
+        return storedValues.value[key]
+      },
+      delete: { key in
+        // Park before removing the first entry — the keychain still
+        // holds the old account while the destroy is suspended.
+        if key == .accessToken && !destroyParked.value {
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseDestroy.value = continuation
+            destroyParked.value = true
+          }
+        }
+        storedValues.value[key] = nil
+      },
+      reset: {}
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(oldTokens) }
+
+    let tokensClient = authTokensClient
+    let jwtClient = JWTAuthClient(
+      baseURL: { "https://api.example.com" },
+      refresh: { _ in .init(access: "access", refresh: "refresh") }
+    )
+
+    let destroyTask = Task { try await tokensClient.destroy() }
+
+    // Wait until the destroy is parked before its first keychain delete.
+    while !destroyParked.value {
+      await Task.yield()
+    }
+
+    // Start the load while the destroy is still parked.
+    parkLoads.value = true
+    let loadTask = Task { try await jwtClient.loadSession() }
+
+    // Ungated: the load reaches the keychain and parks. Gated: it waits
+    // on the persist gate and the bounded spin expires.
+    for _ in 0 ..< 2_000 where !loadParked.value {
+      await Task.yield()
+    }
+
+    if loadParked.value {
+      // Ungated only: let the stale read finish and publish.
+      releaseLoad.value?.resume()
+      parkLoads.value = false
+      try await loadTask.value
+    }
+    parkLoads.value = false
+
+    // Stop counting reads once the destroy resumes, then release it.
+    destroyParked.value = false
+    releaseDestroy.value?.resume()
+    try await destroyTask.value
+    try await loadTask.value
+
+    // The load ran after the destroy finished, read the cleared
+    // keychain, and left memory empty.
+    #expect(session == nil)
+    #expect(loadsWhileParked.value == 0)
+  }
+}

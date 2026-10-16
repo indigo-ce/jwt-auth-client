@@ -138,7 +138,11 @@ extension JWTAuthClient {
   /// during app initialization to restore the user's authentication state.
   ///
   /// The method will only load the session if no session is currently in memory,
-  /// preventing unnecessary keychain operations.
+  /// preventing unnecessary keychain operations. Reads are serialized with the
+  /// live ``AuthTokensClient``'s save/destroy operations, so a load can never
+  /// publish stale keychain tokens while a sign-in save or a destroy is in
+  /// flight — a save that completes while this call was waiting wins, and the
+  /// load becomes a no-op.
   ///
   /// - Throws: An error if the keychain operation fails
   ///
@@ -158,8 +162,29 @@ extension JWTAuthClient {
       session == nil
     else { return }
 
+    // Serialize against persist operations: a load must never read the
+    // keychain while a save or destroy is mid-flight. A load that sneaks
+    // in during a sign-in save could publish the previous account's
+    // tokens after the save already persisted the new one, and a load
+    // during a destroy could republish tokens the destroy just removed.
+    await persistGate.acquire()
+    defer { persistGate.release() }
+
+    // Re-check inside the gate: a save that was in flight when this call
+    // started has now published its session — nothing left to load.
+    guard
+      session == nil
+    else { return }
+
     let tokens = try await keychainClient.loadTokens()
-    $session.withLock { $0 = tokens?.toSession() }
+
+    // Publish only if memory is still empty — a direct write that landed
+    // while this load was reading the keychain wins.
+    $session.withLock { current in
+      if current == nil {
+        current = tokens?.toSession()
+      }
+    }
   }
 
   /// Refreshes expired authentication tokens and persists the new tokens.
