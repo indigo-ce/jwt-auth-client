@@ -15,8 +15,10 @@ token." Only that case destroys credentials; anything else is rethrown.
 A refresh-path failure (network errors, decode errors, etc.) preserves
 the stored tokens so a later retry can succeed. A keychain save failure
 after a *successful* refresh instead keeps the freshly refreshed tokens
-in memory — the old refresh token is already invalidated server-side —
-and rethrows; see ``JWTAuthClient/refreshExpiredTokens()`` for details.
+in memory and rethrows — on backends that invalidate the old refresh
+token immediately (like the Indigo backend) the persisted tokens are
+already dead, so the in-memory copy is the only usable credential; see
+``JWTAuthClient/refreshExpiredTokens()`` for details.
 
 ### Before (any error → destroy)
 

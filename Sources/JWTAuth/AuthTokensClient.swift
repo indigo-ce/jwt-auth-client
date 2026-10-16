@@ -40,9 +40,16 @@ public struct AuthTokensClient: Sendable {
   ///    have succeeded
   ///
   /// The in-memory session is published only after the tokens are durably
-  /// persisted. If a keychain write fails, the keychain is restored to its
-  /// previous state, the in-memory session is left untouched, and the error
-  /// is thrown — observers of `@Shared(.authSession)` never see tokens that
+  /// persisted, and only if no concurrent writer (logout, account switch,
+  /// `loadSession`, …) changed the session while the save was in flight.
+  /// The live implementation additionally serializes save and destroy
+  /// operations, so they can never interleave with each other.
+  ///
+  /// If a keychain write fails, the previous values are best-effort
+  /// restored — restoration itself can fail, in which case the keychain may
+  /// be left without the previous credentials and the user must sign in
+  /// again — the in-memory session is left untouched, and the error is
+  /// thrown. Observers of `@Shared(.authSession)` never see tokens that
   /// aren't persisted.
   ///
   /// - Parameter tokens: The authentication tokens to save
@@ -56,6 +63,8 @@ public struct AuthTokensClient: Sendable {
   /// 2. Removes all tokens from keychain
   ///
   /// Use this method when logging out users or when authentication fails.
+  /// The live implementation serializes save and destroy operations, so a
+  /// concurrent save can never interleave with an in-flight destroy.
   ///
   /// - Throws: An error if the keychain operation fails
   public var destroy: @Sendable () async throws -> Void
@@ -104,13 +113,70 @@ extension AuthTokensClient: TestDependencyKey {
   public static let testValue = Self()
 }
 
+/// A minimal FIFO gate that lets one awaiter run at a time. The live
+/// `AuthTokensClient` uses it to serialize persist operations so that a
+/// concurrent destroy can never interleave with an in-flight save (e.g.
+/// deleting the keychain entries between the save's writes and its session
+/// publication, or vice versa).
+private final class PersistSerialGate: @unchecked Sendable {
+  private let lock = NSLock()
+  private var isRunning = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  /// Suspends until it is the caller's turn, then marks the gate busy.
+  func acquire() async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      let entered = self.lock.withLock {
+        if self.isRunning {
+          self.waiters.append(continuation)
+          return false
+        }
+        self.isRunning = true
+        return true
+      }
+      // Fast path: the gate was free — resume immediately.
+      if entered {
+        continuation.resume()
+      }
+    }
+  }
+
+  /// Marks the gate free and resumes the oldest waiter, if any.
+  func release() {
+    let next = self.lock.withLock { () -> CheckedContinuation<Void, Never>? in
+      if self.waiters.isEmpty {
+        self.isRunning = false
+        return nil
+      }
+      return self.waiters.removeFirst()
+    }
+    next?.resume()
+  }
+}
+
 extension AuthTokensClient: DependencyKey {
   public static let liveValue = { () -> AuthTokensClient in
     @Dependency(\.keychainClient) var keychainClient
+    let persistGate = PersistSerialGate()
 
     @Sendable
     func persist(_ tokens: AuthTokens?) async throws {
       @Shared(.authSession) var session
+
+      // Serialize persist operations: a concurrent destroy must never
+      // interleave with an in-flight save (or vice versa), e.g. deleting
+      // the keychain entries between the save's writes and its session
+      // publication — that would leave memory and the keychain
+      // contradicting each other in both directions.
+      await persistGate.acquire()
+      defer { persistGate.release() }
+
+      // Snapshot the session at entry so the publication below only fires
+      // when no *other* writer (logout from outside this client, account
+      // switch, loadSession, direct writes) changed it while this save was
+      // suspended on the keychain. Persist operations themselves are
+      // already serialized by the gate above; this guard covers the rest.
+      let startSession = session
 
       if let tokens {
         // Write the keychain first and publish the in-memory session only
@@ -149,9 +215,14 @@ extension AuthTokensClient: DependencyKey {
           throw error
         }
 
-        // Both keychain writes succeeded — publish to memory now. On any
+        // Both keychain writes succeeded — publish to memory now, but only
+        // if the session is unchanged since entry (snapshot above). On any
         // failure above, the in-memory session is left untouched.
-        $session.withLock { $0 = tokens.toSession() }
+        $session.withLock { current in
+          if current == startSession {
+            current = tokens.toSession()
+          }
+        }
       } else {
         // Destroy clears the in-memory session first so observers see the
         // logout immediately, then removes both keychain entries explicitly.

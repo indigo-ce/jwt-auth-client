@@ -188,19 +188,22 @@ extension JWTAuthClient {
   ///   out. A concurrent session change (logout, new-user login) that lands
   ///   while the refresh is in flight is therefore preserved.
   /// - If `authTokensClient.set(newTokens)` throws (for example a keychain
-  ///   save failure), the live `AuthTokensClient` restores the keychain to
-  ///   its previous state, and this method publishes the new tokens to the
-  ///   in-memory session before rethrowing. The backend rotates refresh
-  ///   tokens and invalidates the old one immediately — there is no grace
-  ///   window — so the old tokens are already dead server-side and the new
-  ///   tokens are the only valid credentials held on device. Keeping them
-  ///   in memory lets the current session keep working (the new access
-  ///   token is valid), while the rethrown error still signals that
-  ///   persistence failed. The publish is guarded: it only fires when the
-  ///   session still holds the old tokens, so a concurrent logout or
-  ///   account switch that lands during the save is never overwritten.
-  ///   After an app restart the persisted (old) tokens will fail to
-  ///   refresh and the user will be asked to sign in again.
+  ///   save failure), the live `AuthTokensClient` best-effort restores the
+  ///   keychain to its previous state, and this method publishes the new
+  ///   tokens to the in-memory session before rethrowing. Backends that
+  ///   rotate refresh tokens and invalidate the old one immediately (like
+  ///   the Indigo backend — no grace window) leave the old tokens dead
+  ///   server-side, making the new tokens the only valid credentials held
+  ///   on device; keeping them in memory lets the current session keep
+  ///   working (the new access token is valid) while the rethrown error
+  ///   still signals that persistence failed. Backends that keep the old
+  ///   refresh token valid are unaffected either way — the new tokens are
+  ///   equally valid credentials. The publish is guarded: it only fires
+  ///   when the session still holds the old tokens, so a concurrent logout
+  ///   or account switch that lands during the save is never overwritten.
+  ///   After an app restart the persisted (old) tokens fail to refresh —
+  ///   and the user is asked to sign in again — on backends that
+  ///   invalidate the old refresh token immediately.
   ///
   /// In other words: only an explicit rejection from the server destroys the
   /// session. Anything else is treated as a transient hiccup and the user

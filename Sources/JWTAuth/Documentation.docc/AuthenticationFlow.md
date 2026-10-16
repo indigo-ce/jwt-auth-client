@@ -154,15 +154,18 @@ Token refresh is handled automatically by the `sendAuthenticated` methods. Howev
     stored credentials are **preserved** — the refresh token is still valid,
     so a later retry can succeed.
   - If the refresh succeeded but persisting the new tokens failed (for
-    example a keychain error), the keychain is restored to its previous
-    state, but the session still moves to the new tokens: the backend
-    rotates refresh tokens and invalidates the old one immediately (no
-    grace window), so the old tokens are already dead server-side and the
-    new tokens are the only valid credentials on device. They live in
-    memory for the rest of the session; after an app restart the persisted
-    (old) tokens fail to refresh and the user must sign in again. The
-    publish is guarded: a concurrent logout or account switch that lands
-    during the save is never overwritten.
+    example a keychain error), the keychain is best-effort restored to its
+    previous state, but the session still moves to the new tokens. Backends
+    that rotate refresh tokens and invalidate the old one immediately (like
+    the Indigo backend — no grace window) leave the old tokens dead
+    server-side, so the new tokens are the only valid credentials on
+    device: they live in memory for the rest of the session, and after an
+    app restart the persisted (old) tokens fail to refresh and the user
+    must sign in again. (A backend that keeps the old refresh token valid
+    instead lets the persisted tokens work after restart — publishing the
+    new tokens is safe either way, since they are valid credentials too.)
+    The publish is guarded: a concurrent logout or account switch that
+    lands during the save is never overwritten.
 
 ```swift
 @Dependency(\.jwtAuthClient) var authClient

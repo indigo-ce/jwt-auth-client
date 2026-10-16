@@ -912,3 +912,130 @@ private final class Box<T: Sendable>: @unchecked Sendable {
     #expect(session == nil)
   }
 }
+
+@Test func authTokensClientLiveValueSaveDoesNotPublishOverConcurrentSessionChange() async throws {
+  // The live save publishes the new session only when no concurrent writer
+  // changed `@Shared(.authSession)` while the save was suspended on the
+  // keychain. Park the first keychain write, clear the session (a
+  // "logout") from outside while the save is suspended, then release it:
+  // the save must complete without publishing — otherwise it would
+  // resurrect a session the user just destroyed.
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+  let saveParked = Box(false)
+  let releaseSave = Box<CheckedContinuation<Void, Never>?>(nil)
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { _, _ in
+        // Park on the first keychain write so the test can interleave.
+        if !saveParked.value {
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseSave.value = continuation
+            saveParked.value = true
+          }
+        }
+      },
+      load: { _ in nil },
+      delete: { _ in },
+      reset: {}
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(oldTokens) }
+
+    // Copy the resolved client out of the @Dependency wrapper: the Task
+    // closures below would otherwise capture the non-Sendable wrapper.
+    let client = authTokensClient
+
+    let saveTask = Task { try await client.save(newTokens) }
+
+    // Wait until the save is parked on its first keychain write.
+    while !saveParked.value {
+      await Task.yield()
+    }
+
+    // Concurrent logout: clear the session while the save is suspended.
+    $session.withLock { $0 = nil }
+
+    releaseSave.value?.resume()
+    try await saveTask.value
+
+    // The save's keychain writes succeeded, but the concurrent logout
+    // owns the session — the publication must have been skipped.
+    #expect(session == nil)
+  }
+}
+
+@Test func authTokensClientLiveValueSerializesSaveAfterInFlightDestroy() async throws {
+  // Persist operations are serialized: a save started while a destroy is
+  // still parked mid-delete must wait for the destroy to finish. Without
+  // the gate, the save's keychain writes would land between the destroy's
+  // two deletes, leaving the logged-out user's tokens in the keychain
+  // after logout completed. The recorded operation order proves the
+  // destroy ran to completion before the save began.
+  let oldTokens = AuthTokens(access: "old-access", refresh: "old-refresh")
+  let newTokens = AuthTokens(access: "new-access", refresh: "new-refresh")
+  let order = Box<[String]>([])
+  let destroyParked = Box(false)
+  let releaseDestroy = Box<CheckedContinuation<Void, Never>?>(nil)
+
+  try await withDependencies {
+    $0.authTokensClient = .liveValue
+    $0.keychainClient = KeychainClient(
+      save: { _, key in
+        order.value.append("save:\(key.value)")
+      },
+      load: { _ in nil },
+      delete: { key in
+        order.value.append("delete:\(key.value)")
+        // Park on the destroy's first keychain delete.
+        if key == .accessToken && !destroyParked.value {
+          await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseDestroy.value = continuation
+            destroyParked.value = true
+          }
+        }
+      },
+      reset: {}
+    )
+  } operation: {
+    @Dependency(\.authTokensClient) var authTokensClient
+    @Shared(.authSession) var session
+    $session.withLock { $0 = .expired(oldTokens) }
+
+    // Copy the resolved client out of the @Dependency wrapper: the Task
+    // closures below would otherwise capture the non-Sendable wrapper.
+    let client = authTokensClient
+
+    let destroyTask = Task { try await client.destroy() }
+
+    // Wait until the destroy is parked on its first keychain delete.
+    while !destroyParked.value {
+      await Task.yield()
+    }
+
+    // Start a save while the destroy is still parked. The gate must hold
+    // it back until the destroy has fully completed.
+    let saveTask = Task { try await client.save(newTokens) }
+
+    releaseDestroy.value?.resume()
+    try await destroyTask.value
+    try await saveTask.value
+
+    // Strict ordering: both destroy deletes, then both save writes.
+    #expect(order.value == [
+      "delete:accessToken",
+      "delete:refreshToken",
+      "save:accessToken",
+      "save:refreshToken",
+    ])
+
+    // The destroy cleared the session first; the save then ran to
+    // completion and its publication went through against the cleared
+    // session.
+    #expect(session == newTokens.toSession())
+  }
+}
